@@ -1,9 +1,9 @@
-# Scarlet.ai
+# Scarlet.AI
 An Explainable AI Chatbot for College Students, focused on providing reliable information about Rutgers University.  
 
 Most AI chatbots act as black boxes. They give answers without showing where the info came from, how reliable it is, or if the AI might be hallucinating. For college students, this lack of transparency can cause confusion or harm if they act on incorrect information.  
 
-Scarlet.ai aims to solve this by:  
+Scarlet.AI aims to solve this by:  
 - Answering questions about Rutgers resources, deadlines, and campus life.  
 - Providing source transparency (citations, URLs, snippets).  
 - Displaying confidence levels so users know reliability.  
