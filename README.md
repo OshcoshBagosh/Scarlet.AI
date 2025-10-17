@@ -20,8 +20,8 @@ Scarlet.AI provides source transparency (citations, URLs) and displays confidenc
 
 ### 1. Clone and Setup
 ```bash
-git clone git@github.com:OshcoshBagosh/Scarlet.AI.git
-cd knowledge/docling
+git clone -b data-processing-princess https://github.com/OshcoshBagosh/Scarlet.AI.git
+cd Scarlet.AI
 ```
 
 ### 2. Install Dependencies
