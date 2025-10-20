@@ -1,8 +1,14 @@
-**Research Question:** How can an explainable AI chatbot improve Rutgers students' access to accurate and transparent campus resource information compared to a traditional black-box chatbot?
+# Scarlet.AI
+An Explainable AI Chatbot for College Students, focused on providing reliable information about Rutgers University.  
 
 ## Data Collection & Testing
 
-This repository contains the data collection pipeline and testing model for Scarlet.AI, designed to evaluate explainable AI systems against traditional black-box chatbots.
+Scarlet.AI aims to solve this by:  
+- Answering questions about Rutgers resources, deadlines, and campus life.  
+- Providing source transparency (citations, URLs, snippets).  
+- Displaying confidence levels so users know reliability.  
+- Flagging possible hallucinations and encouraging double-checks.  
+- Comparing a black box chatbot with our explainable version to show the added value.  
 
 Scarlet.AI provides source transparency (citations, URLs) and displays confidence levels so users know reliability. We use Rutgers University's public information as our dataset to test this approach.
 
