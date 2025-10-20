@@ -1,7 +1,7 @@
 # Scarlet.AI
 An Explainable AI Chatbot for College Students, focused on providing reliable information about Rutgers University.  
 
-Most AI chatbots act as black boxes. They give answers without showing where the info came from, how reliable it is, or if the AI might be hallucinating. For college students, this lack of transparency can cause confusion or harm if they act on incorrect information.  
+## Data Collection & Testing
 
 Scarlet.AI aims to solve this by:  
 - Answering questions about Rutgers resources, deadlines, and campus life.  
@@ -10,19 +10,43 @@ Scarlet.AI aims to solve this by:
 - Flagging possible hallucinations and encouraging double-checks.  
 - Comparing a black box chatbot with our explainable version to show the added value.  
 
-This project will culminate in a live demo, poster, and GitHub repo for the AI4ALL Symposium.  
+Scarlet.AI provides source transparency (citations, URLs) and displays confidence levels so users know reliability. We use Rutgers University's public information as our dataset to test this approach.
 
----
+**Dataset:** Rutgers-specific sources including official websites, creating a collection of information the chatbot can search and retrieve from when answering student questions.
 
-## Getting Started
+## Data Collection Process
 
-### Clone the Repository
+- **Document Processing**: Docling for web page extraction and chunking
+- **Chunking**: Text segmentation for retrieval of source URLs, title and document structure
+- **Vector Database**: ChromaDB for semantic search
+- **AI Model**: Google Gemini 2.5 Flash
+- **Web Interface**: Streamlit
+
+## How to use
+
+### 1. Clone and Setup
 ```bash
-git clone git@github.com:OshcoshBagosh/Scarlet.ai.git
-cd Scarlet.ai
+git clone -b data-processing-princess https://github.com/OshcoshBagosh/Scarlet.AI.git
+cd Scarlet.AI
 ```
-### Basic Git Commands
+
+### 2. Install Dependencies
+```bash
+pip install -r requirements.txt
 ```
+
+### 3. Run the App
+```bash
+python3 -m streamlit run streamlined_rutgers_app.py --server.port 8502
+```
+
+### 4. Open in Browser
+Go to: `http://localhost:8502`
+
+## Git Commands
+
+### Basic Git Workflow
+```bash
 # Check the status of your repo
 git status
 
@@ -40,3 +64,14 @@ git push origin main
 git pull origin main
 ```
 
+### Working with Branches
+```bash
+# Create a new branch
+git checkout -b your-branch-name
+
+# Switch to main branch
+git checkout main
+
+# Merge your branch into main
+git merge your-branch-name
+```
