@@ -1,24 +1,72 @@
 #!/usr/bin/env python3
 """
-Streamlined Rutgers AI Assistant - Direct from URLs to ChromaDB
-No intermediate JSONL files needed!
+Rutgers AI Assistant (Ollama edition)
+- Loads Rutgers URLs with Docling
+- Chunks & indexes in ChromaDB
+- Answers with an Ollama-hosted LLM (GPU used automatically if available)
+- Optional: use Ollama for embeddings (fully local) or SentenceTransformers
+
+Run:
+  streamlit run rutgers_ollama_app.py --server.port 8502
 """
 
-import streamlit as st
-import chromadb
-import google.generativeai as genai
-from docling.chunking import HybridChunker
-from docling.document_converter import DocumentConverter
-from utils.tokenizer import OpenAITokenizerWrapper
+import os
+import time
+import traceback
 from typing import List, Dict
 
-# Configure Gemini
-genai.configure(api_key="AIzaSyDFtQysHWUJxNaZIXyiDi7GJj32S0nXKd8")
-model = genai.GenerativeModel('gemini-2.5-flash')
+import requests
+import streamlit as st
+import chromadb
+from chromadb.utils import embedding_functions
 
-# Rutgers URLs - Comprehensive List
+# --- Docling imports ---
+from docling.chunking import HybridChunker
+from docling.document_converter import DocumentConverter
+from docling.datamodel.document import InputDocument
+
+
+# --- Ollama (LLM + optional embeddings) ---
+import ollama
+
+# --- Explainability & Evaluation modules ---
+from explainability_module import (
+    calculate_confidence_score,
+    detect_hallucination,
+    generate_confidence_badge_html,
+    generate_hallucination_warning_html,
+    format_sources_with_confidence
+)
+
+from evaluation_module import (
+    EvaluationLogger,
+    render_feedback_widget,
+    render_accuracy_evaluation_widget,
+    render_evaluation_dashboard
+)
+
+# =========================
+# Config (env overrides)
+# =========================
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")         # e.g., "llama3.1:8b"
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+USE_OLLAMA_EMBED = os.getenv("USE_OLLAMA_EMBED", "0") == "1"    # set USE_OLLAMA_EMBED=1 to enable
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
+NUM_CTX = int(os.getenv("NUM_CTX", "8192"))                     # model context window
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
+TOP_K = int(os.getenv("TOP_K", "40"))
+TOP_P = float(os.getenv("TOP_P", "0.9"))
+# Retrieval
+N_RESULTS = int(os.getenv("N_RESULTS", "8"))
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "4000"))     # safety cut for very large chunks
+# Networking
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+
+# =========================
+# Rutgers URLs (full list)
+# =========================
 RUTGERS_URLS = [
-    #Registrar (Calendars, Schedules, Policies)
+    # Registrar (Calendars, Schedules, Policies)
     "https://classes.rutgers.edu/soc/#school?code=01&semester=92025&campus=NB&level=U",
     "https://nbregistrar.rutgers.edu/",
     "https://scheduling.rutgers.edu/academic-calendar/",
@@ -41,8 +89,8 @@ RUTGERS_URLS = [
     "https://www.ugadmissions.rutgers.edu/reenrollment/",
     "https://catalogs.rutgers.edu/generated/nb-ug_1315/pg679.html",
     "https://scarlethub.rutgers.edu/registrar/faculty-staff/",
-    
-    #Financial Aid & Student Accounting
+
+    # Financial Aid & Student Accounting
     "https://finance.rutgers.edu/student-abc/refunds",
     "https://scarlethub.rutgers.edu/financial-services/forms-documents/",
     "https://scarlethub.rutgers.edu/financial-services/financial-aid-disbursement/",
@@ -63,8 +111,8 @@ RUTGERS_URLS = [
     "https://finance.rutgers.edu/student-abc/insurance-students/student-health-insurance-plan-ship",
     "https://scarlethub.rutgers.edu/financial-services/student-employment/students/federal-work-study-program-fwsp/",
     "https://admissions.rutgers.edu/costs-and-aid/scholarships",
-    
-    #Housing & Dining
+
+    # Housing & Dining
     "https://newbrunswick.rutgers.edu/student-housing-and-dining",
     "https://ruoncampus.rutgers.edu/housing-information/continuing-student-housing",
     "https://ruoncampus.rutgers.edu/",
@@ -87,8 +135,8 @@ RUTGERS_URLS = [
     "https://ruoncampus.rutgers.edu/housing-information/housing-cancellation",
     "https://ruoncampus.rutgers.edu/housing-info/special-accommodations",
     "https://ruoncampus.rutgers.edu/housing-info/end-year-hall-closing",
-    
-    #Student Handbook & Conduct
+
+    # Student Handbook & Conduct
     "https://studentconduct.rutgers.edu/",
     "https://studentconduct.rutgers.edu/processes/university-code-student-conduct",
     "https://policies.rutgers.edu/B.aspx?BookId=11912",
@@ -103,8 +151,8 @@ RUTGERS_URLS = [
     "https://studentconduct.rutgers.edu/node",
     "https://studentconduct.rutgers.edu/sites/default/files/pdf/STANDARDS-OF-CONDUCT_aug11.pdf",
     "https://studentconduct.rutgers.edu/node/72",
-    
-    #Student Life & Involvement
+
+    # Student Life & Involvement
     "https://sca.rutgers.edu/campus-involvement/student-organizations",
     "https://sca.rutgers.edu/campus-involvement/get-involved-rutgers/getinvolvedrutgersedu",
     "https://newbrunswick.rutgers.edu/student-activities",
@@ -123,8 +171,8 @@ RUTGERS_URLS = [
     "https://rutgers.campuslabs.com/engage/news",
     "https://recreation.rutgers.edu/club-sports",
     "https://recreation.rutgers.edu/aquatics",
-    
-    #Academics - SAS
+
+    # Academics - SAS
     "https://sas.rutgers.edu/",
     "https://sas.rutgers.edu/academics",
     "https://sas.rutgers.edu/academics/majors-minors",
@@ -134,8 +182,8 @@ RUTGERS_URLS = [
     "https://sas.rutgers.edu/academics/sas-divisions",
     "https://rge.sas.rutgers.edu/",
     "https://sas.rutgers.edu/students/meet-our-students",
-    
-    #Academics - SEBS
+
+    # Academics - SEBS
     "https://sebs.rutgers.edu/",
     "https://sebs.rutgers.edu/academics",
     "https://sebs.rutgers.edu/academics/advisors",
@@ -143,8 +191,8 @@ RUTGERS_URLS = [
     "https://sebs.rutgers.edu/research",
     "https://sebs.rutgers.edu/beyond-the-classroom",
     "https://extension.rutgers.edu/",
-    
-    #Academics - SOE
+
+    # Academics - SOE
     "https://soe.rutgers.edu/",
     "https://soe.rutgers.edu/academics",
     "https://soe.rutgers.edu/academics/undergraduate",
@@ -152,32 +200,32 @@ RUTGERS_URLS = [
     "https://soe.rutgers.edu/research/departments",
     "https://soe.rutgers.edu/research",
     "https://soe.rutgers.edu/advising",
-    
-    #Academics - Mason Gross
+
+    # Academics - Mason Gross
     "https://www.masongross.rutgers.edu/",
     "https://www.masongross.rutgers.edu/events/",
     "https://www.masongross.rutgers.edu/degrees-programs",
     "https://www.masongross.rutgers.edu/admissions",
     "https://www.masongross.rutgers.edu/calendar",
     "https://www.masongross.rutgers.edu/faculty",
-    
-    #Academics - RBS
+
+    # Academics - RBS
     "https://www.business.rutgers.edu/",
     "https://www.business.rutgers.edu/undergraduate-new-brunswick",
     "https://www.business.rutgers.edu/mba",
     "https://www.business.rutgers.edu/phd",
     "https://www.business.rutgers.edu/executive-education",
     "https://www.business.rutgers.edu/faculty-research",
-    
-    #Academics - Bloustein
+
+    # Academics - Bloustein
     "https://bloustein.rutgers.edu/",
     "https://bloustein.rutgers.edu/academics/undergraduate",
     "https://bloustein.rutgers.edu/academics/graduate",
     "https://bloustein.rutgers.edu/research",
     "https://bloustein.rutgers.edu/faculty",
     "https://bloustein.rutgers.edu/upcoming-events/",
-    
-    #Honors College
+
+    # Honors College
     "https://honorscollege.rutgers.edu/",
     "https://honorscollege.rutgers.edu/academics/overview",
     "https://honorscollege.rutgers.edu/academics/academic-affairs-advising",
@@ -186,8 +234,8 @@ RUTGERS_URLS = [
     "https://honorscollege.rutgers.edu/admissions",
     "https://honorscollege.rutgers.edu/current-students",
     "https://honorscollege.rutgers.edu/admissions/transfer-sophomores-and-juniors",
-    
-    #Health & Wellness
+
+    # Health & Wellness
     "https://health.rutgers.edu/",
     "https://health.rutgers.edu/immunizations",
     "https://caps.rutgers.edu/",
@@ -200,8 +248,8 @@ RUTGERS_URLS = [
     "https://health.rutgers.edu/health-education-and-promotion/health-promotion-peer-education/workshops-and-trainings",
     "https://health.rutgers.edu/uwill",
     "https://health.rutgers.edu/resources/togetherall",
-    
-    #Title IX & Safety
+
+    # Title IX & Safety + Transportation
     "https://titleix.rutgers.edu/",
     "https://titleix.rutgers.edu/report",
     "https://titleix.rutgers.edu/resources",
@@ -212,282 +260,492 @@ RUTGERS_URLS = [
     "https://ipo.rutgers.edu/parking",
     "https://ipo.rutgers.edu/parking/permits/students",
     "https://ipo.rutgers.edu/publicsafety",
-    
-    #Transportation
     "https://ipo.rutgers.edu/dots",
     "https://ipo.rutgers.edu/transportation",
     "https://ipo.rutgers.edu/transportation/buses/nb",
-    "https://ipo.rutgers.edu/parking",
-    "https://rutgers.passiogo.com/"
+    "https://rutgers.passiogo.com/",
 ]
 
-@st.cache_resource
-def setup_chromadb():
-    """Setup ChromaDB and load data if needed"""
-    client = chromadb.PersistentClient(path="./chroma_db")
-    
-    # Check if collection exists and has data
-    try:
-        collection = client.get_collection("rutgers_docs")
-        if collection.count() > 0:
-            return collection
-    except:
-        pass  # Collection doesn't exist, which is fine
-    
-    # Create collection and load data
-    collection = client.create_collection(
-        name="rutgers_docs",
-        metadata={"description": "Rutgers University documents and information"}
-    )
-    
-    load_rutgers_data_to_chromadb(collection)
-    
-    return collection
+# =========================
+# Embeddings
+# =========================
+class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    def __init__(self, model: str = OLLAMA_EMBED_MODEL):
+        self.model = model
+    def __call__(self, texts: List[str]):
+        embs = []
+        for t in texts:
+            r = ollama.embeddings(model=self.model, prompt=t)
+            embs.append(r["embedding"])
+        return embs
 
-def load_rutgers_data_to_chromadb(collection):
-    """Load Rutgers data directly from URLs to ChromaDB"""
-    
-    # Initialize tokenizer and chunker
-    tokenizer = OpenAITokenizerWrapper()
-    MAX_TOKENS = 8191
-    
-    # Convert documents
-    converter = DocumentConverter()
-    results = converter.convert_all(RUTGERS_URLS, raises_on_error=False)
-    
-    # Process documents and create URL mapping
-    docs = []
-    url_mapping = {}  # Map filename to full URL
-    
-    for i, result in enumerate(results):
-        if result.document:
-            docs.append(result.document)
-            # Store the mapping from filename to full URL
-            # Try different ways to get the filename
-            filename = f"doc_{i}"
-            if hasattr(result.document, 'meta') and hasattr(result.document.meta, 'origin'):
-                if hasattr(result.document.meta.origin, 'filename'):
-                    filename = result.document.meta.origin.filename
-            elif hasattr(result.document, 'origin'):
-                if hasattr(result.document.origin, 'filename'):
-                    filename = result.document.origin.filename
-            elif hasattr(result.document, 'filename'):
-                filename = result.document.filename
-            
-            url_mapping[filename] = RUTGERS_URLS[i] if i < len(RUTGERS_URLS) else f"https://rutgers.edu/{filename}"
-    
-    # Chunk documents
+def get_embedding_function():
+    if USE_OLLAMA_EMBED:
+        return OllamaEmbeddingFunction(OLLAMA_EMBED_MODEL)
+    # Default: sentence-transformers (CPU ok, simple)
+    # You can pin the model you’ve been using previously:
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="BAAI/bge-small-en-v1.5"
+    )
+
+# =========================
+# LLM (Ollama)
+# =========================
+def call_llm(system_prompt: str, user_prompt: str, temperature: float = TEMPERATURE) -> str:
+    """Single-shot generation (non-streaming) via Ollama."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+    res = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        options={
+            "temperature": float(temperature),
+            "top_k": TOP_K,
+            "top_p": TOP_P,
+            "num_predict": int(MAX_NEW_TOKENS),
+            "num_ctx": int(NUM_CTX),
+        },
+    )
+    return res["message"]["content"].strip()
+
+def call_llm_stream(system_prompt: str, user_prompt: str, temperature: float = TEMPERATURE):
+    """Token streaming for a nice typing effect in Streamlit."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+    stream = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        stream=True,
+        options={
+            "temperature": float(temperature),
+            "top_k": TOP_K,
+            "top_p": TOP_P,
+            "num_predict": int(MAX_NEW_TOKENS),
+            "num_ctx": int(NUM_CTX),
+        },
+    )
+    for chunk in stream:
+        yield chunk["message"]["content"]
+
+# =========================
+# Data loading & chunking
+# =========================
+def fetch_ok(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
+    """Quick HEAD to avoid long hangs on dead servers (best-effort)."""
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True)
+        return r.ok
+    except Exception:
+        return False
+
+def convert_urls_resilient(urls: List[str]) -> List[InputDocument]:
+    """
+    Convert each URL individually so one bad URL doesn't kill the batch.
+    """
+    docs: List[InputDocument] = []
+    conv = DocumentConverter()
+    for i, url in enumerate(urls):
+        try:
+            if not fetch_ok(url):
+                st.warning(f"Skipping (HEAD failed): {url}")
+                continue
+            res = conv.convert(url, raises_on_error=False)
+            if res and res.document:
+                docs.append(res.document)
+            else:
+                st.warning(f"Docling conversion yielded no document: {url}")
+        except Exception as e:
+            st.warning(f"Docling convert failed for {url}: {e}")
+    return docs
+
+def chunk_documents(docs: List[InputDocument]) -> List:
     chunker = HybridChunker(
-        tokenizer=tokenizer,
-        max_tokens=MAX_TOKENS,
+        max_tokens=8191,          # tokenizer handled internally; generous
         merge_peers=True,
     )
-    
     all_chunks = []
-    for i, doc in enumerate(docs):
+    for doc in docs:
         try:
-            chunk_iter = chunker.chunk(dl_doc=doc)
-            all_chunks.extend(list(chunk_iter))
+            for ch in chunker.chunk(dl_doc=doc):
+                # Safety: cap chunk text length to avoid overlong contexts downstream
+                if hasattr(ch, "text"):
+                    ch.text = ch.text[:MAX_CHUNK_CHARS]
+                all_chunks.append(ch)
         except Exception as e:
             st.warning(f"Chunking failed: {e}")
-    
-    #Prepare data for ChromaDB
-    documents = []
-    ids = []
-    metadatas = []
-    
-    for i, chunk in enumerate(all_chunks):
-        # Extract title and URL. Try to get better title from document metadata
-        title = "Rutgers Document"
-        filename = f"doc_{i}"
-        
-        if hasattr(chunk, 'meta'):
-            if hasattr(chunk.meta, 'headings') and chunk.meta.headings:
-                title = chunk.meta.headings[0]
-            elif hasattr(chunk.meta, 'title') and chunk.meta.title:
-                title = chunk.meta.title
-            
-            if hasattr(chunk.meta, 'origin') and hasattr(chunk.meta.origin, 'filename'):
-                filename = chunk.meta.origin.filename
-        elif hasattr(chunk, 'origin') and hasattr(chunk.origin, 'filename'):
-            filename = chunk.origin.filename
-        elif hasattr(chunk, 'filename'):
-            filename = chunk.filename
-        
-        # Use the filename as title if no other title available
-        if title == "Rutgers Document":
-            title = filename.replace('-', ' ').replace('_', ' ').title()
-        
-        url = url_mapping.get(filename, f"https://rutgers.edu/{filename}")
-        
-        
-        documents.append(chunk.text)
+    return all_chunks
+
+def build_metadata(chunk, url_fallback: str):
+    title = "Rutgers Document"
+    filename = "doc"
+    try:
+        # try to get better title
+        if hasattr(chunk, "meta"):
+            m = chunk.meta
+            if hasattr(m, "headings") and m.headings:
+                title = m.headings[0]
+            elif hasattr(m, "title") and m.title:
+                title = m.title
+            if hasattr(m, "origin") and hasattr(m.origin, "filename") and m.origin.filename:
+                filename = m.origin.filename
+    except Exception:
+        pass
+    if title == "Rutgers Document":
+        title = filename.replace("-", " ").replace("_", " ").title()
+    return {"title": title, "url": url_fallback}
+
+# =========================
+# Vector DB (Chroma)
+# =========================
+@st.cache_resource
+def setup_chromadb():
+    client = chromadb.PersistentClient(path="./chroma_db")
+    emb_fn = get_embedding_function()
+
+    # Try load or create
+    try:
+        col = client.get_collection("rutgers_docs", embedding_function=emb_fn)
+        if col.count() > 0:
+            return col
+    except Exception:
+        pass
+
+    col = client.create_collection(
+        name="rutgers_docs",
+        metadata={"description": "Rutgers University documents and information"},
+        embedding_function=emb_fn,
+    )
+
+    # Load data
+    with st.spinner("Converting Rutgers URLs with Docling…"):
+        docs = convert_urls_resilient(RUTGERS_URLS)
+
+    with st.spinner("Chunking documents…"):
+        chunks = chunk_documents(docs)
+
+    # Prepare rows
+    documents, ids, metadatas = [], [], []
+    for i, ch in enumerate(chunks):
+        txt = getattr(ch, "text", "")
+        if not txt.strip():
+            continue
+        # Attempt to infer original URL (doc-level origin can be absent; we fallback to listing index)
+        try:
+            if hasattr(ch, "meta") and hasattr(ch.meta, "origin") and getattr(ch.meta.origin, "source", None):
+                origin_src = ch.meta.origin.source
+                url = origin_src if isinstance(origin_src, str) else str(origin_src)
+            else:
+                url = RUTGERS_URLS[min(i, len(RUTGERS_URLS) - 1)]
+        except Exception:
+            url = RUTGERS_URLS[min(i, len(RUTGERS_URLS) - 1)]
+
+        meta = build_metadata(ch, url)
+        documents.append(txt)
         ids.append(f"rutgers_chunk_{i+1}")
-        metadatas.append({
-            'title': title,
-            'url': url
-        })
-    
-    #Add to ChromaDB
-    collection.add(
-        documents=documents,
-        ids=ids,
-        metadatas=metadatas
-    )
-    
-    st.success(f"✅ Loaded {len(documents)} chunks into ChromaDB")
+        metadatas.append(meta)
 
-def search_rutgers_semantic(collection, query: str, n_results: int = 5):
-    """Search Rutgers data using semantic search"""
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
-    
-    #Format results
-    formatted_results = []
-    for i in range(len(results['documents'][0])):
-        formatted_results.append({
-            'text': results['documents'][0][i],
-            'title': results['metadatas'][0][i]['title'],
-            'url': results['metadatas'][0][i]['url'],
-            'distance': results['distances'][0][i]
-        })
-    
-    return formatted_results
+    if documents:
+        with st.spinner(f"Adding {len(documents)} chunks to Chroma…"):
+            col.add(documents=documents, ids=ids, metadatas=metadatas)
+        st.success(f"✅ Loaded {len(documents)} chunks into ChromaDB")
+    else:
+        st.warning("No documents were added to ChromaDB.")
 
-def ask_rutgers_question(collection, question: str):
-    """Ask a question about Rutgers using semantic search + Gemini"""
-    
-    # Search for relevant chunks using semantic search - get more results for better coverage
-    relevant_chunks = search_rutgers_semantic(collection, question, n_results=10)
-    
-    if not relevant_chunks:
-        return "Sorry, I couldn't find relevant information about that topic in the Rutgers data.", []
-    
-    # Prepare context
-    context_parts = []
-    for chunk in relevant_chunks:
-        context_parts.append(f"Source: {chunk['title']}\nText: {chunk['text']}")
-    
-    context = "\n\n".join(context_parts)
-    
-    # Create prompt
-    prompt = f"""
-    You are a helpful AI assistant for Rutgers University. 
-    Answer the following question based *only* on the provided context.
-    If the answer is not in the context, say "Sorry, I couldn't find relevant information about that topic in the Rutgers data."
-    
-    Question: {question}
-    
-    Context:
-    {context}
+    return col
+
+def search_semantic(col, query: str, n_results: int = N_RESULTS):
+    res = col.query(query_texts=[query], n_results=n_results)
+    out = []
+    if not res or not res.get("documents"):
+        return out
+    docs = res["documents"][0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0]
+    for i in range(len(docs)):
+        out.append({
+            "text": docs[i],
+            "title": metas[i].get("title", "Source"),
+            "url": metas[i].get("url", ""),
+            "distance": dists[i] if i < len(dists) else None,
+        })
+    return out
+
+# =========================
+# RAG ask function
+# =========================
+def ask_rutgers_question(col, question: str, stream: bool = True):
     """
+    Enhanced RAG with explainability features.
+    Returns: (answer, chunks, stream_generator, confidence_level, is_hallucination)
+    """
+    chunks = search_semantic(col, question, n_results=N_RESULTS)
     
-    #Gemini response
-    response = model.generate_content(prompt)
-    return response.text, relevant_chunks
+    # Calculate confidence early
+    confidence_level, emoji, color, avg_distance = calculate_confidence_score(chunks)
+    
+    if not chunks:
+        return "Sorry, I couldn't find relevant information about that topic in the Rutgers data.", [], None, "No Data", True
 
-# ---------------------------------------------- Streamlit UI ----------------------------------------------
-# Streamlit UI
-st.set_page_config(
-    page_title="Rutgers AI Assistant",
-    page_icon="🏛️",
-    layout="wide"
-)
+    parts = []
+    for ch in chunks:
+        # keep prompt compact; model quality > verbatim wall of text
+        snippet = ch["text"]
+        parts.append(f"[{ch['title']}]({ch['url']})\n{snippet}")
 
-# Streamlit CSS
+    context = "\n\n---\n\n".join(parts[:N_RESULTS])
+
+    system = (
+        "You are a helpful Rutgers University assistant. "
+        "Answer ONLY from the provided context. If the answer isn't there, say "
+        "\"Sorry, I couldn't find relevant information about that topic in the Rutgers data.\" "
+        "Include concise inline citations like [Title](URL) when applicable."
+    )
+
+    user = (
+        f"Question: {question}\n\n"
+        f"Context (sources with snippets):\n{context}\n\n"
+        "Answer:"
+    )
+
+    if stream:
+        return None, chunks, call_llm_stream(system, user), confidence_level, False
+    else:
+        answer = call_llm(system, user)
+        
+        # Detect potential hallucination
+        is_hallucination, reason = detect_hallucination(chunks, answer, confidence_level)
+        
+        return answer, chunks, None, confidence_level, is_hallucination
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Rutgers AI Assistant (Ollama)", page_icon="🏛️", layout="wide")
+
 st.markdown("""
 <style>
-.main-header {
-    color: #CC0000;
-    text-align: center;
-    font-size: 2.5em;
-    margin-bottom: 1em;
-}
-.source-box {
-    background-color: #f9f9f9;
-    padding: 0.5rem;
-    border-radius: 5px;
-    margin: 0.5rem 0;
-    border-left: 3px solid #CC0000;
-    color: #000000;
-}
-.source-box a {
-    color: #CC0000;
-    text-decoration: none;
-    font-weight: bold;
-}
+.main-header { color:#CC0000; text-align:center; font-size:2.2em; margin-bottom:0.7em; }
+.source-box { background:#f9f9f9; padding:.6rem; border-radius:6px; margin:.4rem 0; border-left:3px solid #CC0000; color:#000; }
+.source-box a { color:#CC0000; text-decoration:none; font-weight:bold; }
+.small { font-size: 0.9em; color:#333; }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize chat history
+st.markdown('<h1 class="main-header">🏛️ Rutgers University AI Assistant (Ollama)</h1>', unsafe_allow_html=True)
+
+# Quick Ollama health check
+try:
+    _ = ollama.list()  # ensures daemon is reachable
+except Exception:
+    st.error("Could not reach Ollama. Start it first (e.g., `ollama serve`) and ensure a model is pulled.")
+    st.stop()
+
+# Cache chat state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Setup ChromaDB
-collection = setup_chromadb()
+# Initialize evaluation logger
+if "eval_logger" not in st.session_state:
+    st.session_state.eval_logger = EvaluationLogger()
 
-# Header
-st.markdown('<h1 class="main-header">🏛️ Rutgers University AI Assistant</h1>', unsafe_allow_html=True)
+# Initialize dashboard state
+if "show_dashboard" not in st.session_state:
+    st.session_state.show_dashboard = False
 
-# Sidebar
+# Setup Chroma
+with st.spinner("Initializing vector DB…"):
+    collection = setup_chromadb()
+
+# Sidebar info
 with st.sidebar:
-    st.header("📊 Database Info")
-    st.write(f"Documents loaded: {collection.count()}")
-    
-    if st.button("🔄 Reload Data"):
+    st.subheader("⚙️ Model & DB")
+    st.write(f"**LLM:** `{OLLAMA_MODEL}`")
+    st.write(f"**Embeddings:** `{'Ollama: ' + OLLAMA_EMBED_MODEL if USE_OLLAMA_EMBED else 'BAAI/bge-small-en-v1.5'}`")
+    try:
+        st.write(f"**Documents loaded:** {collection.count()}")
+    except Exception:
+        st.write("**Documents loaded:** (unknown)")
+
+    if st.button("🔄 Rebuild Index"):
         st.cache_resource.clear()
         st.rerun()
+    
+    st.markdown("---")
+    
+    # Mode selector
+    mode = st.selectbox(
+        "🔍 Select Mode",
+        ["Explainable AI", "Black Box"],
+        help="Compare transparent AI vs traditional chatbot"
+    )
+    
+    st.markdown("---")
+    
+    # Evaluation dashboard button
+    if st.button("📊 View Evaluation Dashboard"):
+        st.session_state.show_dashboard = True
+    
+    # Show stats preview
+    stats = st.session_state.eval_logger.get_summary_stats()
+    st.markdown("### 📈 Quick Stats")
+    st.write(f"**Interactions:** {stats['total_interactions']}")
+    st.write(f"**Feedback:** {stats['total_feedback']}")
+    if stats['total_feedback'] > 0:
+        st.write(f"**Avg Trust:** {stats['avg_trust']:.1f}/5")
+        st.write(f"**Helpful:** {stats['helpful_percent']:.0f}%")
 
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Show dashboard if requested
+if st.session_state.get("show_dashboard", False):
+    render_evaluation_dashboard(st.session_state.eval_logger)
+    if st.button("← Back to Chat"):
+        st.session_state.show_dashboard = False
+        st.rerun()
+    st.stop()
+
+# Render chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
         
-        if message["role"] == "assistant" and "sources" in message:
-            with st.expander(f"📚 Sources ({len(message['sources'])} found)"):
-                for i, source in enumerate(message["sources"]):
-                    # Use the actual URL from the source
-                    url = source['url']
-                    
-                    st.markdown(f"""
-                    <div class="source-box">
-                        <strong>{i+1}. {source['title']}</strong>
-                        <br><small>Relevance: {source['distance']:.3f} | <a href="{url}" target="_blank">🔗 View Source</a></small>
-                    </div>
-                    """, unsafe_allow_html=True)
+        # Show confidence badge for explainable mode answers
+        if msg["role"] == "assistant" and msg.get("confidence"):
+            conf_level = msg["confidence"]
+            if conf_level == "High":
+                st.caption("🟢 High Confidence")
+            elif conf_level == "Medium":
+                st.caption("🟡 Medium Confidence")
+            elif conf_level == "Low":
+                st.caption("🔴 Low Confidence")
+            
+            # Show warning badge if applicable
+            if msg.get("had_warning"):
+                st.caption("⚠️ Verification recommended")
+        
+        # Show sources
+        if msg.get("sources"):
+            with st.expander(f"📚 Sources ({len(msg['sources'])})"):
+                for i, s in enumerate(msg["sources"]):
+                    url = s["url"]
+                    distance = s.get("distance", 1.0)
+                    st.markdown(
+                        f"""
+                        <div class="source-box">
+                          <strong>{i+1}. {s['title']}</strong><br>
+                          <span class="small">Relevance: {distance:.3f} |
+                          <a href="{url}" target="_blank">🔗 View Source</a></span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
-# Chat input
-if prompt := st.chat_input("Ask me anything about Rutgers University..."):
-    # Add user message
+# Input
+prompt = st.chat_input("Ask me anything about Rutgers University…")
+
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    #Get response
     with st.chat_message("assistant"):
-        with st.spinner("Searching Rutgers knowledge base..."):
-            answer, sources = ask_rutgers_question(collection, prompt)
-        
-        st.markdown(answer)
-        
-        if sources:
-            with st.expander(f"📚 Sources ({len(sources)} found)"):
-                for i, source in enumerate(sources):
-                    # Use the actual URL from the source
-                    url = source['url']
-                    
-                    st.markdown(f"""
-                    <div class="source-box">
-                        <strong>{i+1}. {source['title']}</strong>
-                        <br><small>Relevance: {source['distance']:.3f} | <a href="{url}" target="_blank">🔗 View Source</a></small>
-                    </div>
-                    """, unsafe_allow_html=True)
-    
-    #Add the responses to chat history
+        try:
+            # Determine current mode
+            current_mode = "explainable" if mode == "Explainable AI" else "black_box"
+            
+            with st.spinner("Searching Rutgers knowledge base…"):
+                answer, sources, stream_gen, confidence_level, is_hallucination = ask_rutgers_question(
+                    collection, prompt, stream=True
+                )
+
+            # Stream response
+            if stream_gen:
+                placeholder = st.empty()
+                buf = []
+                for piece in stream_gen:
+                    buf.append(piece)
+                    placeholder.markdown("".join(buf))
+                answer = "".join(buf)
+                
+                # Re-check for hallucination after streaming
+                if sources:
+                    is_hallucination, reason = detect_hallucination(sources, answer, confidence_level)
+            else:
+                st.markdown(answer)
+            
+            # EXPLAINABLE MODE: Show confidence and warnings
+            if current_mode == "explainable":
+                # Calculate confidence
+                conf_level, conf_emoji, conf_color, avg_dist = calculate_confidence_score(sources)
+                
+                # Display confidence badge
+                st.markdown(
+                    generate_confidence_badge_html(conf_level, conf_emoji, conf_color, avg_dist),
+                    unsafe_allow_html=True
+                )
+                
+                # Display hallucination warning if detected
+                if is_hallucination:
+                    is_hal, reason = detect_hallucination(sources, answer, conf_level)
+                    if is_hal:
+                        st.markdown(
+                            generate_hallucination_warning_html(reason),
+                            unsafe_allow_html=True
+                        )
+
+            # Show sources (both modes, but formatted differently)
+            if sources:
+                if current_mode == "explainable":
+                    with st.expander(f"📚 Sources ({len(sources)}) - Click to view"):
+                        st.markdown(
+                            format_sources_with_confidence(sources),
+                            unsafe_allow_html=True
+                        )
+                else:
+                    # Black box mode: minimal source display
+                    with st.expander(f"📚 Sources ({len(sources)})"):
+                        for i, s in enumerate(sources):
+                            st.markdown(f"{i+1}. [{s['title']}]({s['url']})")
+            
+            # Log interaction
+            st.session_state.eval_logger.log_interaction(
+                question=prompt,
+                answer=answer,
+                sources=sources,
+                mode=current_mode,
+                confidence_level=confidence_level if current_mode == "explainable" else "N/A",
+                had_warning=is_hallucination if current_mode == "explainable" else False
+            )
+            
+            # Render feedback widget
+            render_feedback_widget(
+                logger=st.session_state.eval_logger,
+                question=prompt,
+                mode=current_mode,
+                confidence_level=confidence_level if current_mode == "explainable" else "N/A",
+                num_sources=len(sources),
+                had_warning=is_hallucination if current_mode == "explainable" else False
+            )
+            
+            # Render accuracy evaluation (for testers)
+            render_accuracy_evaluation_widget(
+                logger=st.session_state.eval_logger,
+                question=prompt,
+                answer=answer
+            )
+
+        except Exception as e:
+            answer = f"⚠️ Error during answer generation:\n\n```\n{traceback.format_exc()}\n```"
+            sources = []
+            confidence_level = "Error"
+            is_hallucination = True
+
     st.session_state.messages.append({
-        "role": "assistant", 
+        "role": "assistant",
         "content": answer,
-        "sources": sources
+        "sources": sources,
+        "confidence": confidence_level if mode == "Explainable AI" else None,
+        "had_warning": is_hallucination if mode == "Explainable AI" else None
     })
