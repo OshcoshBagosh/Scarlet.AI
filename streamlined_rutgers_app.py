@@ -342,11 +342,12 @@ def fetch_ok(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
     except Exception:
         return False
 
-def convert_urls_resilient(urls: List[str]) -> List[InputDocument]:
+def convert_urls_resilient(urls: List[str]) -> List[tuple]:
     """
     Convert each URL individually so one bad URL doesn't kill the batch.
+    Returns list of (InputDocument, original_url) tuples.
     """
-    docs: List[InputDocument] = []
+    docs_with_urls: List[tuple] = []
     conv = DocumentConverter()
     for i, url in enumerate(urls):
         try:
@@ -355,26 +356,35 @@ def convert_urls_resilient(urls: List[str]) -> List[InputDocument]:
                 continue
             res = conv.convert(url, raises_on_error=False)
             if res and res.document:
-                docs.append(res.document)
+                # Store the document with its original URL
+                docs_with_urls.append((res.document, url))
             else:
                 st.warning(f"Docling conversion yielded no document: {url}")
         except Exception as e:
             st.warning(f"Docling convert failed for {url}: {e}")
-    return docs
+    return docs_with_urls
 
-def chunk_documents(docs: List[InputDocument]) -> List:
+def chunk_documents(docs_with_urls: List[tuple]) -> List:
+    """
+    Chunk documents and attach the original URL to each chunk.
+    Args:
+        docs_with_urls: List of (InputDocument, original_url) tuples
+    Returns:
+        List of (chunk, original_url) tuples
+    """
     chunker = HybridChunker(
         max_tokens=8191,          # tokenizer handled internally; generous
         merge_peers=True,
     )
     all_chunks = []
-    for doc in docs:
+    for doc, original_url in docs_with_urls:
         try:
             for ch in chunker.chunk(dl_doc=doc):
                 # Safety: cap chunk text length to avoid overlong contexts downstream
                 if hasattr(ch, "text"):
                     ch.text = ch.text[:MAX_CHUNK_CHARS]
-                all_chunks.append(ch)
+                # Attach the original URL directly to each chunk
+                all_chunks.append((ch, original_url))
         except Exception as e:
             st.warning(f"Chunking failed: {e}")
     return all_chunks
@@ -402,15 +412,22 @@ def build_metadata(chunk, url_fallback: str):
 # Vector DB (Chroma)
 # =========================
 @st.cache_resource
-def setup_chromadb():
+def setup_chromadb(force_rebuild: bool = False):
     client = chromadb.PersistentClient(path="./chroma_db")
     emb_fn = get_embedding_function()
 
-    # Try load or create
+    # Check if we need to rebuild
+    if not force_rebuild:
+        try:
+            col = client.get_collection("rutgers_docs", embedding_function=emb_fn)
+            if col.count() > 0:
+                return col
+        except Exception:
+            pass
+
+    # Delete existing collection if it exists (for rebuild)
     try:
-        col = client.get_collection("rutgers_docs", embedding_function=emb_fn)
-        if col.count() > 0:
-            return col
+        client.delete_collection("rutgers_docs")
     except Exception:
         pass
 
@@ -422,26 +439,40 @@ def setup_chromadb():
 
     # Load data
     with st.spinner("Converting Rutgers URLs with Docling…"):
-        docs = convert_urls_resilient(RUTGERS_URLS)
+        docs_with_urls = convert_urls_resilient(RUTGERS_URLS)
 
     with st.spinner("Chunking documents…"):
-        chunks = chunk_documents(docs)
+        chunks = chunk_documents(docs_with_urls)
 
     # Prepare rows
     documents, ids, metadatas = [], [], []
-    for i, ch in enumerate(chunks):
+    for i, item in enumerate(chunks):
+        # item is (chunk, original_url) per chunk_documents()
+        try:
+            ch, original_url = item
+        except Exception:
+            # Defensive fallback
+            ch = item
+            original_url = ""
+
         txt = getattr(ch, "text", "")
         if not txt.strip():
             continue
-        # Attempt to infer original URL (doc-level origin can be absent; we fallback to listing index)
+        
+        # Try to extract URL from chunk metadata first, fallback to original_url
+        url = original_url  # Default to the URL we tracked
         try:
-            if hasattr(ch, "meta") and hasattr(ch.meta, "origin") and getattr(ch.meta.origin, "source", None):
-                origin_src = ch.meta.origin.source
-                url = origin_src if isinstance(origin_src, str) else str(origin_src)
-            else:
-                url = RUTGERS_URLS[min(i, len(RUTGERS_URLS) - 1)]
+            if hasattr(ch, "meta") and hasattr(ch.meta, "origin"):
+                # Check various possible source fields
+                if hasattr(ch.meta.origin, "source") and ch.meta.origin.source:
+                    origin_src = ch.meta.origin.source
+                    url = origin_src if isinstance(origin_src, str) else str(origin_src)
+                elif hasattr(ch.meta.origin, "uri") and ch.meta.origin.uri:
+                    url = str(ch.meta.origin.uri)
+                elif hasattr(ch.meta.origin, "url") and ch.meta.origin.url:
+                    url = str(ch.meta.origin.url)
         except Exception:
-            url = RUTGERS_URLS[min(i, len(RUTGERS_URLS) - 1)]
+            pass  # Keep the original_url fallback
 
         meta = build_metadata(ch, url)
         documents.append(txt)
@@ -557,8 +588,14 @@ if "show_dashboard" not in st.session_state:
     st.session_state.show_dashboard = False
 
 # Setup Chroma
+# Force rebuild flag (can be triggered by sidebar button)
+force_rebuild = st.session_state.get("force_rebuild", False)
+if force_rebuild:
+    st.session_state.force_rebuild = False  # Reset flag
+    st.cache_resource.clear()  # Clear cache to force rebuild
+
 with st.spinner("Initializing vector DB…"):
-    collection = setup_chromadb()
+    collection = setup_chromadb(force_rebuild=force_rebuild)
 
 # Sidebar info
 with st.sidebar:
@@ -571,6 +608,7 @@ with st.sidebar:
         st.write("**Documents loaded:** (unknown)")
 
     if st.button("🔄 Rebuild Index"):
+        st.session_state.force_rebuild = True
         st.cache_resource.clear()
         st.rerun()
     
