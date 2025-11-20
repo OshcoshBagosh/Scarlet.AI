@@ -35,7 +35,9 @@ from explainability_module import (
     detect_hallucination,
     generate_confidence_badge_html,
     generate_hallucination_warning_html,
-    format_sources_with_confidence
+    format_sources_with_confidence,
+    load_calibration_model,
+    perform_claim_level_checking
 )
 
 from evaluation_module import (
@@ -43,6 +45,14 @@ from evaluation_module import (
     render_feedback_widget,
     render_accuracy_evaluation_widget,
     render_evaluation_dashboard
+)
+
+# --- Topic Classification & Policy-Aware Response ---
+from topic_classifier import TopicClassifier
+from policy_aware_module import (
+    PolicyAwareResponder,
+    create_risk_aware_rag_prompt,
+    apply_policy_aware_modulation
 )
 
 # =========================
@@ -508,33 +518,75 @@ def search_semantic(col, query: str, n_results: int = N_RESULTS):
 # =========================
 # RAG ask function
 # =========================
-def ask_rutgers_question(col, question: str, stream: bool = True):
+def ask_rutgers_question(col, question: str, stream: bool = True, 
+                        enable_claim_checking: bool = False, 
+                        enable_policy_aware: bool = True):
     """
-    Enhanced RAG with explainability features.
-    Returns: (answer, chunks, stream_generator, confidence_level, is_hallucination)
+    Enhanced RAG with explainability features, claim-level checking, and policy-aware responses.
+    Returns: (answer, chunks, stream_generator, confidence_data, is_hallucination, claim_audit, policy_modulation)
     """
+    # Step 1: Classify topic for policy-aware routing
+    topic_classification = None
+    policy_modulation = None
+    
+    if enable_policy_aware:
+        if 'topic_classifier' not in st.session_state:
+            st.session_state.topic_classifier = TopicClassifier(llm_client=ollama, model=OLLAMA_MODEL)
+        
+        topic_classification = st.session_state.topic_classifier.classify(question, use_llm=False)
+    
+    # Step 2: Retrieve relevant chunks
     chunks = search_semantic(col, question, n_results=N_RESULTS)
     
-    # Calculate confidence early
-    confidence_level, emoji, color, avg_distance = calculate_confidence_score(chunks)
+    # Step 3: Calculate calibrated confidence
+    confidence_level, emoji, color, avg_distance, calibrated_prob, calibration_info = calculate_confidence_score(
+        chunks, use_calibration=True
+    )
+    
+    confidence_data = {
+        'level': confidence_level,
+        'emoji': emoji,
+        'color': color,
+        'avg_distance': avg_distance,
+        'calibrated_prob': calibrated_prob,
+        'calibration_info': calibration_info
+    }
     
     if not chunks:
-        return "Sorry, I couldn't find relevant information about that topic in the Rutgers data.", [], None, "No Data", True
+        return "Sorry, I couldn't find relevant information about that topic in the Rutgers data.", [], None, confidence_data, True, None, None
 
     parts = []
     for ch in chunks:
-        # keep prompt compact; model quality > verbatim wall of text
         snippet = ch["text"]
         parts.append(f"[{ch['title']}]({ch['url']})\n{snippet}")
 
     context = "\n\n---\n\n".join(parts[:N_RESULTS])
 
-    system = (
-        "You are a helpful Rutgers University assistant. "
-        "Answer ONLY from the provided context. If the answer isn't there, say "
-        "\"Sorry, I couldn't find relevant information about that topic in the Rutgers data.\" "
-        "Include concise inline citations like [Title](URL) when applicable."
-    )
+    # Step 4: Create policy-aware system prompt if enabled
+    if enable_policy_aware and topic_classification:
+        guidelines = st.session_state.topic_classifier.get_risk_guidelines(
+            topic_classification['category_enum']
+        )
+        
+        # Add risk-specific instructions to prompt
+        system_modifier = PolicyAwareResponder(st.session_state.topic_classifier).generate_system_prompt_modifier(
+            topic_classification
+        )
+        
+        system = (
+            "You are a helpful Rutgers University assistant. "
+            "Answer ONLY from the provided context. If the answer isn't there, say "
+            "\"Sorry, I couldn't find relevant information about that topic in the Rutgers data.\" "
+            "Include concise inline citations like [Title](URL) when applicable."
+            + system_modifier
+        )
+    else:
+        system = (
+            "You are a helpful Rutgers University assistant. "
+            "Answer ONLY from the provided context. If the answer isn't there, say "
+            "\"Sorry, I couldn't find relevant information about that topic in the Rutgers data.\" "
+            "Include concise inline citations like [Title](URL) when applicable."
+        )
 
     user = (
         f"Question: {question}\n\n"
@@ -542,15 +594,33 @@ def ask_rutgers_question(col, question: str, stream: bool = True):
         "Answer:"
     )
 
+    # Step 5: Generate answer
     if stream:
-        return None, chunks, call_llm_stream(system, user), confidence_level, False
+        return None, chunks, call_llm_stream(system, user), confidence_data, False, None, topic_classification
     else:
         answer = call_llm(system, user)
         
-        # Detect potential hallucination
+        # Step 6: Detect potential hallucination
         is_hallucination, reason = detect_hallucination(chunks, answer, confidence_level)
         
-        return answer, chunks, None, confidence_level, is_hallucination
+        # Step 7: Perform claim-level checking if enabled
+        claim_audit = None
+        if enable_claim_checking:
+            claim_verifications, claim_audit_html = perform_claim_level_checking(
+                answer, col, llm_client=ollama, model=OLLAMA_MODEL
+            )
+            claim_audit = {
+                'verifications': claim_verifications,
+                'html': claim_audit_html
+            }
+        
+        # Step 8: Apply policy-aware modulation
+        if enable_policy_aware and topic_classification:
+            policy_modulation = apply_policy_aware_modulation(
+                question, answer, chunks, st.session_state.topic_classifier
+            )
+        
+        return answer, chunks, None, confidence_data, is_hallucination, claim_audit, policy_modulation
 
 # =========================
 # UI
@@ -586,6 +656,23 @@ if "eval_logger" not in st.session_state:
 # Initialize dashboard state
 if "show_dashboard" not in st.session_state:
     st.session_state.show_dashboard = False
+
+# Load calibration model on startup
+if "calibration_loaded" not in st.session_state:
+    try:
+        if load_calibration_model():
+            st.session_state.calibration_loaded = True
+            st.sidebar.success("✅ Calibration model loaded")
+        else:
+            st.session_state.calibration_loaded = False
+            st.sidebar.info("ℹ️ No calibration model found. Run calibration_script.py to create one.")
+    except Exception as e:
+        st.session_state.calibration_loaded = False
+        st.sidebar.warning(f"⚠️ Calibration model load failed: {e}")
+
+# Initialize topic classifier
+if "topic_classifier" not in st.session_state:
+    st.session_state.topic_classifier = TopicClassifier(llm_client=ollama, model=OLLAMA_MODEL)
 
 # Setup Chroma
 # Force rebuild flag (can be triggered by sidebar button)
@@ -623,6 +710,28 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # Advanced Features (Explainable Mode Only)
+    if mode == "Explainable AI":
+        st.subheader("🔬 Advanced Features")
+        
+        enable_claim_checking = st.checkbox(
+            "Enable Claim-Level Checking",
+            value=False,
+            help="Verify each claim in the answer independently"
+        )
+        
+        enable_policy_aware = st.checkbox(
+            "Enable Policy-Aware Responses",
+            value=True,
+            help="Adjust responses based on topic sensitivity"
+        )
+        
+        # Store in session state
+        st.session_state.enable_claim_checking = enable_claim_checking
+        st.session_state.enable_policy_aware = enable_policy_aware
+        
+        st.markdown("---")
+    
     # Evaluation dashboard button
     if st.button("📊 View Evaluation Dashboard"):
         st.session_state.show_dashboard = True
@@ -644,12 +753,11 @@ if st.session_state.get("show_dashboard", False):
         st.rerun()
     st.stop()
 
-# Render chat history
-for msg in st.session_state.messages:
+"""Chat history rendering (without feedback forms to avoid delayed appearance)."""
+# Render past chat messages (excluding feedback forms; feedback shown only for latest answer)
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        
-        # Show confidence badge for explainable mode answers
         if msg["role"] == "assistant" and msg.get("confidence"):
             conf_level = msg["confidence"]
             if conf_level == "High":
@@ -658,12 +766,8 @@ for msg in st.session_state.messages:
                 st.caption("🟡 Medium Confidence")
             elif conf_level == "Low":
                 st.caption("🔴 Low Confidence")
-            
-            # Show warning badge if applicable
             if msg.get("had_warning"):
                 st.caption("⚠️ Verification recommended")
-        
-        # Show sources
         if msg.get("sources"):
             with st.expander(f"📚 Sources ({len(msg['sources'])})"):
                 for i, s in enumerate(msg["sources"]):
@@ -687,15 +791,23 @@ if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+    # Pre-compute prospective assistant message id for stable feedback widget
+    latest_message_id = len(st.session_state.messages) + 1
 
     with st.chat_message("assistant"):
         try:
             # Determine current mode
             current_mode = "explainable" if mode == "Explainable AI" else "black_box"
             
+            # Get feature flags
+            enable_claim_checking = st.session_state.get("enable_claim_checking", False) and current_mode == "explainable"
+            enable_policy_aware = st.session_state.get("enable_policy_aware", True)
+            
             with st.spinner("Searching Rutgers knowledge base…"):
-                answer, sources, stream_gen, confidence_level, is_hallucination = ask_rutgers_question(
-                    collection, prompt, stream=True
+                answer, sources, stream_gen, confidence_data, is_hallucination, claim_audit, policy_modulation = ask_rutgers_question(
+                    collection, prompt, stream=True,
+                    enable_claim_checking=enable_claim_checking,
+                    enable_policy_aware=enable_policy_aware
                 )
 
             # Stream response
@@ -709,29 +821,91 @@ if prompt:
                 
                 # Re-check for hallucination after streaming
                 if sources:
-                    is_hallucination, reason = detect_hallucination(sources, answer, confidence_level)
-            else:
+                    is_hallucination, reason = detect_hallucination(sources, answer, confidence_data['level'])
+                
+                # Re-do claim checking and policy modulation after streaming
+                if enable_claim_checking and sources:
+                    claim_verifications, claim_audit_html = perform_claim_level_checking(
+                        answer, collection, llm_client=ollama, model=OLLAMA_MODEL
+                    )
+                    claim_audit = {
+                        'verifications': claim_verifications,
+                        'html': claim_audit_html
+                    }
+                
+                if enable_policy_aware:
+                    policy_modulation = apply_policy_aware_modulation(
+                        prompt, answer, sources, st.session_state.topic_classifier
+                    )
+            
+            # POLICY-AWARE MODE: Show critical disclaimers at top
+            if current_mode == "explainable" and policy_modulation:
+                risk_level = policy_modulation['risk_level']
+                
+                # High-risk topics get prominent disclaimer at top
+                if risk_level == 'high' and policy_modulation['disclaimer']:
+                    st.markdown(f"""
+                    <div style="background: #dc3545; color: white; padding: 1rem; 
+                                border-radius: 8px; margin-bottom: 1rem; border: 3px solid #a02a2a;">
+                        <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 0.5rem;">
+                            ⚠️ IMPORTANT SAFETY INFORMATION
+                        </div>
+                        <div style="white-space: pre-line;">
+                            {policy_modulation['disclaimer']}
+                        </div>
+                        {f'<div style="margin-top: 0.8rem; padding-top: 0.8rem; border-top: 1px solid rgba(255,255,255,0.3); font-weight: bold;">{policy_modulation["contact_info"]}</div>' if policy_modulation.get('contact_info') else ''}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Use modulated answer for high-risk topics
+                    if policy_modulation.get('modified_answer'):
+                        answer = policy_modulation['modified_answer']
+            
+            # Display answer (potentially modulated)
+            if not stream_gen:
                 st.markdown(answer)
             
             # EXPLAINABLE MODE: Show confidence and warnings
             if current_mode == "explainable":
-                # Calculate confidence
-                conf_level, conf_emoji, conf_color, avg_dist = calculate_confidence_score(sources)
-                
-                # Display confidence badge
+                # Display calibrated confidence badge
                 st.markdown(
-                    generate_confidence_badge_html(conf_level, conf_emoji, conf_color, avg_dist),
+                    generate_confidence_badge_html(
+                        confidence_data['level'],
+                        confidence_data['emoji'],
+                        confidence_data['color'],
+                        confidence_data['avg_distance'],
+                        confidence_data.get('calibrated_prob'),
+                        confidence_data.get('calibration_info'),
+                        answer_text=answer
+                    ),
                     unsafe_allow_html=True
                 )
                 
                 # Display hallucination warning if detected
                 if is_hallucination:
-                    is_hal, reason = detect_hallucination(sources, answer, conf_level)
+                    is_hal, reason = detect_hallucination(sources, answer, confidence_data['level'])
                     if is_hal:
                         st.markdown(
                             generate_hallucination_warning_html(reason),
                             unsafe_allow_html=True
                         )
+                
+                # Medium-risk disclaimer (shown after answer)
+                if policy_modulation and policy_modulation['risk_level'] == 'medium' and policy_modulation['disclaimer']:
+                    st.markdown(f"""
+                    <div style="background: #fff3cd; border: 2px solid #ffc107; padding: 0.8rem; 
+                                border-radius: 8px; margin: 1rem 0;">
+                        <div style="color: #856404;">
+                            <strong>⚠️ Please Verify:</strong> {policy_modulation['disclaimer']}
+                        </div>
+                        {f'<div style="margin-top: 0.5rem; color: #856404;"><strong>Contact:</strong> {policy_modulation["contact_info"]}</div>' if policy_modulation.get('contact_info') else ''}
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Show claim-level audit if enabled
+                if claim_audit and claim_audit['html']:
+                    with st.expander("🔍 Claim-Level Evidence Audit", expanded=False):
+                        st.components.v1.html(claim_audit['html'], height=400, scrolling=True)
 
             # Show sources (both modes, but formatted differently)
             if sources:
@@ -747,24 +921,54 @@ if prompt:
                         for i, s in enumerate(sources):
                             st.markdown(f"{i+1}. [{s['title']}]({s['url']})")
             
-            # Log interaction
+            # Extract confidence level for logging
+            conf_level_str = confidence_data['level'] if current_mode == "explainable" else "N/A"
+            
+            # Extract policy-aware metadata
+            topic_cat = None
+            risk_lvl = None
+            had_disclaimer = False
+            if policy_modulation:
+                topic_cat = policy_modulation.get('category')
+                risk_lvl = policy_modulation.get('risk_level')
+                had_disclaimer = policy_modulation.get('disclaimer') is not None
+            
+            # Extract claim verifications
+            claim_verifs = None
+            if claim_audit:
+                claim_verifs = claim_audit.get('verifications')
+            
+            # Log interaction with all feature metadata
             st.session_state.eval_logger.log_interaction(
                 question=prompt,
                 answer=answer,
                 sources=sources,
                 mode=current_mode,
-                confidence_level=confidence_level if current_mode == "explainable" else "N/A",
-                had_warning=is_hallucination if current_mode == "explainable" else False
+                confidence_level=conf_level_str,
+                had_warning=is_hallucination if current_mode == "explainable" else False,
+                claim_checking_enabled=enable_claim_checking,
+                policy_aware_enabled=enable_policy_aware,
+                topic_category=topic_cat,
+                risk_level=risk_lvl,
+                had_policy_disclaimer=had_disclaimer,
+                claim_verifications=claim_verifs
             )
-            
-            # Render feedback widget
+
+            # Render feedback widget immediately for this answer (before rerun)
+            latest_message_id = len(st.session_state.messages) + 1  # prospective id
             render_feedback_widget(
                 logger=st.session_state.eval_logger,
                 question=prompt,
                 mode=current_mode,
-                confidence_level=confidence_level if current_mode == "explainable" else "N/A",
+                confidence_level=conf_level_str,
                 num_sources=len(sources),
-                had_warning=is_hallucination if current_mode == "explainable" else False
+                had_warning=is_hallucination if current_mode == "explainable" else False,
+                claim_checking_enabled=enable_claim_checking,
+                policy_aware_enabled=enable_policy_aware,
+                topic_category=topic_cat,
+                risk_level=risk_lvl,
+                had_policy_disclaimer=had_disclaimer,
+                widget_id=f"answer_{latest_message_id}"
             )
             
             # Render accuracy evaluation (for testers)
@@ -777,13 +981,25 @@ if prompt:
         except Exception as e:
             answer = f"⚠️ Error during answer generation:\n\n```\n{traceback.format_exc()}\n```"
             sources = []
-            confidence_level = "Error"
+            confidence_data = {'level': 'Error', 'emoji': '❌', 'color': '#dc3545', 'avg_distance': 1.0}
+            conf_level_str = "Error"
             is_hallucination = True
+            policy_modulation = None
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
         "sources": sources,
-        "confidence": confidence_level if mode == "Explainable AI" else None,
-        "had_warning": is_hallucination if mode == "Explainable AI" else None
+        "confidence": conf_level_str if mode == "Explainable AI" else None,
+        "had_warning": is_hallucination if mode == "Explainable AI" else None,
+        "policy_modulation": policy_modulation if mode == "Explainable AI" else None,
+        "question": prompt,
+        "mode": current_mode,
+        "num_sources": len(sources),
+        "claim_checking_enabled": enable_claim_checking,
+        "policy_aware_enabled": enable_policy_aware,
+        "topic_category": topic_cat,
+        "risk_level": risk_lvl,
+        "had_policy_disclaimer": had_disclaimer,
+        "message_id": latest_message_id
     })
