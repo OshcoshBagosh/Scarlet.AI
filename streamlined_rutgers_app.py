@@ -13,12 +13,14 @@ Run:
 import os
 import time
 import traceback
+import random
 from typing import List, Dict
 
 import requests
 import streamlit as st
 import chromadb
 from chromadb.utils import embedding_functions
+import base64
 
 # --- Docling imports ---
 from docling.chunking import HybridChunker
@@ -45,10 +47,14 @@ from evaluation_module import (
     render_evaluation_dashboard
 )
 
+def get_base64_image(image_path):
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode()
+
 # =========================
 # Config (env overrides)
 # =========================
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")         # e.g., "llama3.1:8b"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")         # e.g., "llama3.1:8b"
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 USE_OLLAMA_EMBED = os.getenv("USE_OLLAMA_EMBED", "0") == "1"    # set USE_OLLAMA_EMBED=1 to enable
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
@@ -61,6 +67,119 @@ N_RESULTS = int(os.getenv("N_RESULTS", "8"))
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "4000"))     # safety cut for very large chunks
 # Networking
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+
+# =========================
+# Quick Questions & Campus Data
+# =========================
+# =========================
+# Enhanced Quick Questions with Answers
+# =========================
+QUICK_QUESTIONS = {
+    "What is in-state tuition?": {
+        "answer": "For the 2024-2025 academic year, in-state tuition at Rutgers is approximately $16,000-$17,000 per year for full-time undergraduate students. This varies by school and program. You should check the official tuition page for the most current rates.",
+        "sources": [
+            {"title": "Tuition and Fees", "url": "https://admissions.rutgers.edu/costs-and-aid/tuition-fees"},
+            {"title": "Student Accounting", "url": "https://finance.rutgers.edu/student-abc"}
+        ]
+    },
+    "How to apply for financial aid?": {
+        "answer": "To apply for financial aid at Rutgers, you need to:\n1. Complete the FAFSA (Free Application for Federal Student Aid)\n2. Use Rutgers school code 002629\n3. Complete any additional required forms through the Rutgers financial aid portal\n4. Submit documents by the priority deadline for maximum aid consideration",
+        "sources": [
+            {"title": "Financial Aid Application", "url": "https://financialaid.rutgers.edu/financial-services/apply-for-aid/how-to-apply"},
+            {"title": "FAFSA Information", "url": "https://scarlethub.rutgers.edu/financial-services/apply-for-aid/how-to-apply/fafsa"}
+        ]
+    },
+    "Where is the student center?": {
+        "answer": "Rutgers has multiple student centers across campuses:\n• **College Avenue**: Rutgers Student Center\n• **Livingston**: Livingston Student Center\n• **Busch**: Busch Student Center\n• **Cook/Douglas**: Cook Student Center\nEach center offers dining, study spaces, meeting rooms, and student organization offices.",
+        "sources": [
+            {"title": "Student Centers", "url": "https://sca.rutgers.edu/student-centers"},
+            {"title": "Campus Locations", "url": "https://newbrunswick.rutgers.edu/student-housing-and-dining"}
+        ]
+    },
+    "What are dining hall hours?": {
+        "answer": "Dining hall hours vary by location and semester. Generally:\n• **Weekdays**: 7:00 AM - 8:00 PM\n• **Weekends**: 9:00 AM - 7:00 PM\n• Some locations have extended hours\nCheck the Rutgers Food Services website for current hours and locations.",
+        "sources": [
+            {"title": "Dining Locations & Hours", "url": "https://food.rutgers.edu/places-eat"},
+            {"title": "Meal Plan Information", "url": "https://food.rutgers.edu/meal-plans"}
+        ]
+    },
+    "How to contact academic advising?": {
+        "answer": "You can contact academic advising through:\n1. Your specific school's advising office (SAS, SOE, RBS, etc.)\n2. Schedule appointments through Starfish or your school's portal\n3. Visit advising offices during walk-in hours\n4. Email your assigned advisor directly",
+        "sources": [
+            {"title": "SAS Advising", "url": "https://sas.rutgers.edu/about/sas-offices/detail/office-of-advising-and-academic-services"},
+            {"title": "Academic Support", "url": "https://sasundergrad.rutgers.edu/"}
+        ]
+    },
+    "When is the add/drop period?": {
+        "answer": "The add/drop period is typically the first 10 days of each semester. For Fall 2024, it's September 3-10. During this period, you can add or drop courses without penalty. Check the academic calendar for exact dates each semester.",
+        "sources": [
+            {"title": "Academic Calendar", "url": "https://scheduling.rutgers.edu/academic-calendar/"},
+            {"title": "Registration Policies", "url": "https://nbregistrar.rutgers.edu/"}
+        ]
+    },
+    "Where is the health center?": {
+        "answer": "Rutgers Health Services has multiple locations:\n• **Hurtado Health Center** on College Avenue\n• **Busch-Livingston Health Center** \n• **Cook-Douglass Health Center**\nAll centers provide medical care, counseling, immunizations, and wellness services. Appointments are recommended.",
+        "sources": [
+            {"title": "Health Services Locations", "url": "https://health.rutgers.edu/about-us/hours-and-locations"},
+            {"title": "Medical Services", "url": "https://health.rutgers.edu/medical-and-counseling-services/medical-services"}
+        ]
+    },
+    "How to join a student club?": {
+        "answer": "To join a student club:\n1. Browse organizations on GetInvolved.Rutgers.edu\n2. Attend the Student Involvement Fair each semester\n3. Contact club leaders through their social media or email\n4. Attend meetings and events\nThere are over 500 student organizations to choose from!",
+        "sources": [
+            {"title": "Student Organizations", "url": "https://sca.rutgers.edu/campus-involvement/student-organizations"},
+            {"title": "Get Involved Portal", "url": "https://involvement.rutgers.edu/"}
+        ]
+    }
+}
+
+def render_quick_questions():
+    """Render quick action buttons with pre-built answers"""
+    st.markdown("### 🚀 Quick Questions")
+    cols = st.columns(2)
+    
+    questions = list(QUICK_QUESTIONS.keys())
+    for i, question in enumerate(questions):
+        with cols[i % 2]:
+            if st.button(f"• {question}", key=f"quick_{i}", use_container_width=True, type="secondary"):
+                # Directly add to chat history like a normal message
+                st.session_state.messages.append({"role": "user", "content": question})
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": QUICK_QUESTIONS[question]["answer"],
+                    "sources": QUICK_QUESTIONS[question]["sources"],
+                    "confidence": "High",
+                    "is_quick_answer": True
+                })
+                st.rerun()
+
+
+CAMPUS_TRIVIA = [
+    "Did you know? Rutgers was founded in 1766!",
+    "Fun fact: The Scarlet Knight became mascot in 1955",
+    "Rutgers is the 8th oldest college in the United States",
+    "Rutgers has three campuses: New Brunswick, Newark, and Camden",
+    "The first intercollegiate football game was at Rutgers in 1869",
+]
+
+DEPARTMENTS = {
+    "Registrar": "https://nbregistrar.rutgers.edu/",
+    "Financial Aid": "https://financialaid.rutgers.edu/",
+    "Housing": "https://ruoncampus.rutgers.edu/",
+    "Health Services": "https://health.rutgers.edu/",
+    "Career Services": "https://careers.rutgers.edu/",
+    "Student Affairs": "https://studentaffairs.rutgers.edu/",
+    "Academic Advising": "https://sas.rutgers.edu/academics/advising"
+}
+
+IMPORTANT_DATES = {
+    "Add/Drop Period": "Sep 2-11",
+    "Thanksgiving Break": "Nov 27-30",
+    "Winter Break": "Dec 23 - Jan 21",
+    "Spring Registration": "Nov 1",
+    "Finals": "Dec 15-22",
+    "Commencement": "May 17"
+}
 
 # =========================
 # Rutgers URLs (full list)
@@ -283,7 +402,7 @@ def get_embedding_function():
     if USE_OLLAMA_EMBED:
         return OllamaEmbeddingFunction(OLLAMA_EMBED_MODEL)
     # Default: sentence-transformers (CPU ok, simple)
-    # You can pin the model you’ve been using previously:
+    # You can pin the model you've been using previously:
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="BAAI/bge-small-en-v1.5"
     )
@@ -506,6 +625,144 @@ def search_semantic(col, query: str, n_results: int = N_RESULTS):
     return out
 
 # =========================
+# Enhanced UI Functions
+# =========================
+def typing_animation():
+    """Show typing animation while processing"""
+    placeholder = st.empty()
+    for i in range(3):
+        placeholder.markdown("🤔 Searching Rutgers knowledge base" + "." * (i + 1))
+        time.sleep(0.5)
+    return placeholder
+
+def format_smart_response(answer, sources):
+    """Detect response type and format accordingly"""
+    
+    # Detect urgent information (health, safety, deadlines)
+    urgent_keywords = ['emergency', 'deadline', 'urgent', 'crisis', 'immediately']
+    if any(keyword in answer.lower() for keyword in urgent_keywords):
+        st.markdown('<div class="urgent-message">🚨 ' + answer + '</div>', unsafe_allow_html=True)
+    
+    # Detect step-by-step instructions
+    elif 'step' in answer.lower() or 'first' in answer.lower() and 'then' in answer.lower():
+        steps = answer.split('\n')
+        st.markdown("### 📋 Step-by-Step Guide:")
+        for step in steps:
+            if step.strip():
+                st.markdown(f"• {step.strip()}")
+    
+    else:
+        # Regular formatted response
+        st.markdown(answer)
+
+def render_quick_questions():
+    """Render quick action buttons with pre-built answers"""
+    st.markdown("### 🚀 Quick Questions")
+    cols = st.columns(2)
+    
+    questions = list(QUICK_QUESTIONS.keys())
+    for i, question in enumerate(questions):
+        with cols[i % 2]:
+            if st.button(f"• {question}", key=f"quick_{i}", use_container_width=True, type="secondary"):
+                # Directly add to chat history like a normal message
+                st.session_state.messages.append({"role": "user", "content": question})
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": QUICK_QUESTIONS[question]["answer"],
+                    "sources": QUICK_QUESTIONS[question]["sources"],
+                    "confidence": "High",
+                    "is_quick_answer": True
+                })
+                st.rerun()
+
+def render_department_links():
+    """Render department quick links in sidebar"""
+    st.sidebar.markdown("### 📞 Quick Departments")
+    for dept, url in DEPARTMENTS.items():
+        st.sidebar.markdown(f'<a href="{url}" target="_blank" style="color: white; text-decoration: none;">📎 {dept}</a>', 
+                           unsafe_allow_html=True)
+
+def render_academic_timeline():
+    """Render academic timeline in sidebar"""
+    st.sidebar.markdown("### 📅 Academic Timeline")
+    for event, date in IMPORTANT_DATES.items():
+        st.sidebar.write(f"**{event}:** {date}")
+
+def render_emergency_contacts():
+    """Render emergency contacts in sidebar"""
+    if st.sidebar.button("🚨 Emergency Contacts"):
+            st.markdown("""
+            **Campus Police:** (848) 932-7211  
+            **Health Services:** (848) 932-7402  
+            **Counseling:** (848) 932-7884  
+            **Title IX:** (848) 932-8200
+            **Any Emergency:** 911
+            """)
+
+def render_response_rating():
+    """Add response rating system after each assistant response"""
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+        st.markdown("---")
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            if st.button("👍 Helpful", key="helpful", use_container_width=True):
+                st.success("Thanks for your feedback!")
+                # Log positive feedback
+                st.session_state.eval_logger.log_feedback(
+                    question=st.session_state.messages[-2]["content"] if len(st.session_state.messages) > 1 else "Unknown",
+                    rating=5,
+                    comments="User marked as helpful"
+                )
+        with col2:
+            if st.button("👎 Not Helpful", key="not_helpful", use_container_width=True):
+                st.info("Sorry about that! Try rephrasing your question.")
+        with col3:
+            if st.button("📋 More Details", key="more_details", use_container_width=True):
+                with st.expander("Need more help?"):
+                    st.markdown("""
+                    **Contact Rutgers Support:**
+                    - 📞 General Help: (848) 445-INFO
+                    - 🌐 [Rutgers Help Portal](https://myrun.newark.rutgers.edu/)
+                    - 💻 [IT Help Desk](https://it.rutgers.edu/)
+                    """)
+
+def render_conversation_context():
+    """Show recent conversation topics in sidebar"""
+    if len(st.session_state.messages) > 4:
+        st.sidebar.markdown("### 💭 Conversation Context")
+        st.sidebar.caption("Recent topics:")
+        recent_topics = [msg["content"][:30] + "..." for msg in st.session_state.messages[-3:] if msg["role"] == "user"]
+        for topic in recent_topics:
+            st.sidebar.write(f"• {topic}")
+
+def show_campus_trivia():
+    """Show campus trivia every 2 interactions (works for both quick questions and regular chat)"""
+    # Count all interactions (both quick questions and regular chat)
+    if "interaction_count" not in st.session_state:
+        st.session_state.interaction_count = 0
+    
+    # Check if we have a new interaction
+    total_messages = len([msg for msg in st.session_state.messages 
+                         if msg["content"] != "Welcome message shown"])
+    
+    # Only count when we have a new pair of messages (user + assistant)
+    if total_messages > st.session_state.last_message_count:
+        # Check if this is a complete interaction (user message followed by assistant)
+        if (len(st.session_state.messages) >= 2 and 
+            st.session_state.messages[-1]["role"] == "assistant" and 
+            st.session_state.messages[-2]["role"] == "user"):
+            
+            st.session_state.interaction_count += 1
+            st.session_state.last_message_count = total_messages
+            
+            # Show trivia every 2 interactions
+            if st.session_state.interaction_count % 2 == 0:
+                st.sidebar.markdown("---")
+                st.sidebar.markdown("### 🎓 Campus Trivia")
+                st.sidebar.markdown(f"*{random.choice(CAMPUS_TRIVIA)}*")
+                st.sidebar.markdown("")
+
+# =========================
 # RAG ask function
 # =========================
 def ask_rutgers_question(col, question: str, stream: bool = True):
@@ -555,18 +812,393 @@ def ask_rutgers_question(col, question: str, stream: bool = True):
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Rutgers AI Assistant (Ollama)", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="Prompto", layout="wide")
 
 st.markdown("""
 <style>
-.main-header { color:#CC0000; text-align:center; font-size:2.2em; margin-bottom:0.7em; }
-.source-box { background:#f9f9f9; padding:.6rem; border-radius:6px; margin:.4rem 0; border-left:3px solid #CC0000; color:#000; }
-.source-box a { color:#CC0000; text-decoration:none; font-weight:bold; }
-.small { font-size: 0.9em; color:#333; }
+/* Overall Page Background - Subtle texture or solid light */
+.stApp {
+    background: linear-gradient(135deg, #8B0000 0%, #A52A2A 25%, #B22222, #CD5C5C 75%, #DC143C 100%);
+    background-size: 400% 400%; 
+    animation: gradientShift 15s ease infinite;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    min-height: 100vh;
+}
+
+/* Header Container with image overlay */
+.header-container {
+    position: relative;
+    text-align: center;
+    padding: 30px 0 30px 0;
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border-radius: 0 0 20px 20px;
+    box-shadow: 0 4px 20px rgba(204, 0, 0, 0.1);
+    margin-bottom: 20px;
+    margin-top: 50px; 
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+/* Logo Styling - Positioned above text */
+.logo-container {
+    position: relative;
+    z-index: 2;
+    margin-bottom: -20px; /* Overlap with text */
+}
+
+/* Title Styling - Positioned below image */
+.title-container {
+    position: relative;
+    z-index: 1;
+    margin-top: -10px; /* Pull text up to overlap with image */
+    padding-top: 40px; /* Space for image */
+}
+
+.main-title {
+    font-size: 3.5em;
+    font-weight: 900;
+    background: linear-gradient(135deg, #CC0000, #8B0000);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin: 5px 0;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+}
+
+.main-subtitle {
+    font-size: 1.3em;
+    color: #666;
+    margin-bottom: 15px;
+    font-weight: 300;
+}
+
+/* Scarlet Divider */
+.scarlet-divider {
+    height: 4px;
+    background: linear-gradient(90deg, #CC0000, #8B0000, #CC0000);
+    margin: 10px auto 20px auto;
+    width: 80%;
+    border-radius: 2px;
+}
+
+/* Enhanced Sidebar Styling */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #CC0000 0%, #8B0000 100%);
+    color: white;
+    padding-top: 2rem;
+}
+
+[data-testid="stSidebar"] .sidebar-header {
+    text-align: center;
+    padding: 0 0 20px 0;
+    border-bottom: 2px solid rgba(255,255,255,0.2);
+    margin-bottom: 20px;
+}
+
+[data-testid="stSidebar"] h2, 
+[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] strong {
+    color: white !important;
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+}
+
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] a {
+    color: #FFDDDD !important;
+}
+
+/* Enhanced Buttons */
+[data-testid="stSidebar"] div.stButton > button {
+    background: linear-gradient(135deg, #A00000, #8B0000);
+    color: white;
+    border: none;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 10px 20px;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 15px rgba(160, 0, 0, 0.3);
+}
+
+[data-testid="stSidebar"] div.stButton > button:hover {
+    background: linear-gradient(135deg, #FF3333, #CC0000);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(255, 51, 51, 0.4);
+}
+
+/* Enhanced Chat Input */
+[data-testid="stTextInput"] > div > div > input {
+    border: 2px solid #CC0000;
+    border-radius: 12px;
+    padding: 12px 18px;
+    font-size: 1.1em;
+    background: white;
+    box-shadow: 0 4px 15px rgba(204, 0, 0, 0.1);
+    transition: all 0.3s ease;
+}
+
+[data-testid="stTextInput"] > div > div > input:focus {
+    border-color: #FF3333;
+    box-shadow: 0 4px 20px rgba(204, 0, 0, 0.3);
+    transform: translateY(-1px);
+}
+
+[data-testid="stTextInput"] > div > button {
+    background: linear-gradient(135deg, #CC0000, #A00000);
+    color: white;
+    border-radius: 12px;
+    padding: 10px 20px;
+    transition: all 0.3s ease;
+    border: none;
+}
+
+[data-testid="stTextInput"] > div > button:hover {
+    background: linear-gradient(135deg, #FF3333, #CC0000);
+    transform: scale(1.05);
+}
+
+/* Enhanced Chat Messages */
+[data-testid="stChatMessage"] {
+    background: white;
+    border-radius: 15px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    margin-bottom: 1.2rem;
+    padding: 1rem 1.5rem;
+    border: 1px solid #e0e0e0;
+    transition: all 0.3s ease;
+}
+
+[data-testid="stChatMessage"]:hover {
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+    transform: translateY(-2px);
+}
+
+/* User Message specific styling */
+[data-testid="stChatMessage"]:has(div.st-emotion-cache-p5mllp) {
+    background: linear-gradient(135deg, #f0f0f0, #e8e8e8);
+    text-align: right;
+    border-top-right-radius: 0;
+    border-left: 4px solid #CC0000;
+}
+
+[data-testid="stChatMessage"]:has(div.st-emotion-cache-1r7r3cn) {
+    background: linear-gradient(135deg, #ffffff, #f8f8f8);
+    text-align: left;
+    border-top-left-radius: 0;
+    border-left: 4px solid #CC0000;
+}
+
+/* Custom Message Bubbles */
+.user-message {
+    background: linear-gradient(135deg, #CC0000, #8B0000);
+    color: white;
+    border-radius: 18px 18px 4px 18px;
+    padding: 12px 16px;
+    margin: 8px 0;
+    max-width: 80%;
+    margin-left: auto;
+}
+
+.assistant-message {
+    background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+    color: #333;
+    border-radius: 18px 18px 18px 4px;
+    padding: 12px 16px;
+    margin: 8px 0;
+    max-width: 80%;
+    border-left: 4px solid #CC0000;
+}
+
+.urgent-message {
+    background: linear-gradient(135deg, #fff3cd, #ffeeba);
+    border: 2px solid #ffc107;
+    border-radius: 12px;
+    padding: 12px;
+    margin: 10px 0;
+    color: #856404;
+    font-weight: bold;
+}
+
+/* Source Box - Enhanced */
+.source-box { 
+    background: linear-gradient(135deg, #FFF5F5, #FFE8E8);
+    padding: 1rem; 
+    border-radius: 10px; 
+    margin: .6rem 0; 
+    border-left: 6px solid #CC0000;
+    color: #333; 
+    box-shadow: 0 2px 8px rgba(204,0,0,0.1);
+    transition: all 0.3s ease;
+}
+
+.source-box:hover {
+    transform: translateX(5px);
+    box-shadow: 0 4px 12px rgba(204,0,0,0.2);
+}
+
+.source-box a { 
+    color: #990000;
+    text-decoration: none; 
+    font-weight: bold; 
+    transition: color 0.2s;
+}
+.source-box a:hover {
+    color: #CC0000;
+}
+
+/* Confidence Badges - Enhanced */
+.confidence-badge {
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-weight: bold;
+    margin: 10px 5px 5px 0;
+    font-size: 0.85em;
+    background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+    color: #333;
+    border: 2px solid #ddd;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.confidence-badge.high { 
+    background: linear-gradient(135deg, #d4edda, #c3e6cb);
+    color: #155724; 
+    border-color: #28a745;
+}
+.confidence-badge.medium { 
+    background: linear-gradient(135deg, #fff3cd, #ffeeba);
+    color: #856404; 
+    border-color: #ffc107;
+}
+.confidence-badge.low { 
+    background: linear-gradient(135deg, #f8d7da, #f5c6cb);
+    color: #721c24; 
+    border-color: #dc3545;
+}
+
+.warning-badge {
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-weight: bold;
+    margin: 10px 5px;
+    background: linear-gradient(135deg, #ffebee, #ffcdd2);
+    color: #CC0000;
+    border: 2px solid #CC0000;
+    font-size: 0.85em;
+    box-shadow: 0 2px 8px rgba(204,0,0,0.2);
+}
+
+/* Quick Questions Styling */
+.quick-question-btn {
+    background: linear-gradient(135deg, #CC0000, #A00000) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    padding: 10px 15px !important;
+    margin: 5px 0 !important;
+    transition: all 0.3s ease !important;
+    box-shadow: 0 2px 8px rgba(204,0,0,0.2) !important;
+    width: 100% !important;
+}
+
+.quick-question-btn:hover {
+    background: linear-gradient(135deg, #FF3333, #CC0000) !important;
+    transform: translateY(-2px) !important;
+    box-shadow: 0 4px 15px rgba(255,51,51,0.3) !important;
+}
+
+/* Stats Card */
+.stats-card {
+    background: white;
+    padding: 15px;
+    border-radius: 12px;
+    border-left: 5px solid #CC0000;
+    margin: 10px 0;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    transition: all 0.3s ease;
+}
+
+.stats-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+}
+
+/* Floating animation for header */
+@keyframes float {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-5px); }
+    100% { transform: translateY(0px); }
+}
+
+.logo-container img {
+    animation: float 3s ease-in-out infinite;
+}
+
+/* Pulse animation for new messages */
+@keyframes pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+    100% { transform: scale(1); }
+}
+
+.new-message {
+    animation: pulse 0.5s ease-in-out;
+}
+            
+.header-logo {
+    width: 100px;
+    border-radius: 50%;
+    box-shadow: 0 8px 25px rgba(204,0,0,0.3);
+    border: 4px solid white;
+}
+
+/* Rating buttons */
+.rating-buttons {
+    display: flex;
+    gap: 10px;
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #eee;
+}
+
+/* Background animation */
+@keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<h1 class="main-header">🏛️ Rutgers University AI Assistant (Ollama)</h1>', unsafe_allow_html=True)
+# Header with image
+try:
+    img_base64 = get_base64_image("scarlet_logo.png")
+    st.markdown(f"""
+    <div class="header-container">
+        <div class="logo-container">
+            <img src='data:image/png;base64,{img_base64}' class='header-logo' alt='Scarlet Mind Logo'>
+        </div>
+        <div class="title-container">
+            <h1 class="main-title">Prompto</h1>
+            <p class="main-subtitle">Your AI Assistant for Rutgers University</p>
+        </div>
+        <div class="scarlet-divider"></div>
+    </div>
+    """, unsafe_allow_html=True)
+except FileNotFoundError:
+    st.warning("Logo image not found.")
+    st.markdown("""
+    <div class="header-container">
+        <div class="title-container">
+            <h1 class="main-title">Prompto</h1>
+            <p class="main-subtitle">Your AI Assistant for Rutgers University</p>
+        </div>
+        <div class="scarlet-divider"></div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Quick Ollama health check
 try:
@@ -583,9 +1215,36 @@ if "messages" not in st.session_state:
 if "eval_logger" not in st.session_state:
     st.session_state.eval_logger = EvaluationLogger()
 
+# Initialize trivia tracking
+if "interaction_count" not in st.session_state:
+    st.session_state.interaction_count = 0
+if "last_message_count" not in st.session_state:
+    st.session_state.last_message_count = 0
+
 # Initialize dashboard state
 if "show_dashboard" not in st.session_state:
     st.session_state.show_dashboard = False
+
+# First-time user experience
+if "first_visit" not in st.session_state:
+    st.session_state.first_visit = True
+    with st.chat_message("assistant"):
+        st.markdown("""
+        👋 **Welcome to Prompto!** 
+        
+        I can help you with:
+        • 📚 Academic questions
+        • 🏠 Housing & dining  
+        • 💰 Financial aid
+        • 🏛️ Campus services
+        • 🎓 And much more!
+        
+        *Try asking about deadlines, locations, or campus resources!*
+        """)
+    st.session_state.messages.append({
+        "role": "assistant", 
+        "content": "Welcome message shown"
+    })
 
 # Setup Chroma
 # Force rebuild flag (can be triggered by sidebar button)
@@ -623,6 +1282,14 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # Enhanced sidebar features
+    render_department_links()
+    st.markdown("---")
+    render_academic_timeline()
+    st.markdown("---")
+    render_emergency_contacts()
+        
+    
     # Evaluation dashboard button
     if st.button("📊 View Evaluation Dashboard"):
         st.session_state.show_dashboard = True
@@ -635,6 +1302,10 @@ with st.sidebar:
     if stats['total_feedback'] > 0:
         st.write(f"**Avg Trust:** {stats['avg_trust']:.1f}/5")
         st.write(f"**Helpful:** {stats['helpful_percent']:.0f}%")
+    
+    # Show conversation context and trivia
+    render_conversation_context()
+    show_campus_trivia()
 
 # Show dashboard if requested
 if st.session_state.get("show_dashboard", False):
@@ -644,41 +1315,47 @@ if st.session_state.get("show_dashboard", False):
         st.rerun()
     st.stop()
 
+# Render quick questions
+render_quick_questions()
+st.markdown("---")
+
+
 # Render chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        
-        # Show confidence badge for explainable mode answers
-        if msg["role"] == "assistant" and msg.get("confidence"):
-            conf_level = msg["confidence"]
-            if conf_level == "High":
-                st.caption("🟢 High Confidence")
-            elif conf_level == "Medium":
-                st.caption("🟡 Medium Confidence")
-            elif conf_level == "Low":
-                st.caption("🔴 Low Confidence")
+        if msg["role"] == "user":
+            st.markdown(f'<div class="user-message">{msg["content"]}</div>', unsafe_allow_html=True)
+        else:
+            if msg["content"] != "Welcome message shown":
+                format_smart_response(msg["content"], msg.get("sources", []))         
+            # Show confidence badge for explainable mode answers
+            if msg["role"] == "assistant" and msg.get("confidence"):
+                conf_level = msg["confidence"]
+                if conf_level == "High":
+                    st.caption("🟢 High Confidence")
+                elif conf_level == "Medium":
+                    st.caption("🟡 Medium Confidence")
+                elif conf_level == "Low":
+                    st.caption("🔴 Low Confidence")
+                
+                # Show warning badge if applicable
+                if msg.get("had_warning"):
+                    st.caption("⚠️ Verification recommended")
             
-            # Show warning badge if applicable
-            if msg.get("had_warning"):
-                st.caption("⚠️ Verification recommended")
-        
-        # Show sources
-        if msg.get("sources"):
-            with st.expander(f"📚 Sources ({len(msg['sources'])})"):
-                for i, s in enumerate(msg["sources"]):
-                    url = s["url"]
-                    distance = s.get("distance", 1.0)
-                    st.markdown(
-                        f"""
-                        <div class="source-box">
-                          <strong>{i+1}. {s['title']}</strong><br>
-                          <span class="small">Relevance: {distance:.3f} |
-                          <a href="{url}" target="_blank">🔗 View Source</a></span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+            # Show sources
+            if msg.get("sources") and msg["content"] != "Welcome message shown":
+                current_mode = "explainable" if mode == "Explainable AI" else "black_box"
+                if current_mode == "explainable":
+                    with st.expander(f"📚 Sources ({len(msg['sources'])}) - Click to view"):
+                        st.markdown(
+                            format_sources_with_confidence(msg['sources']),
+                            unsafe_allow_html=True
+                        )
+                else:
+                    # Black box mode: minimal source display
+                    with st.expander(f"📚 Sources ({len(msg['sources'])})"):
+                        for i, s in enumerate(msg['sources']):
+                            st.markdown(f"{i+1}. [{s['title']}]({s['url']})")
 
 # Input
 prompt = st.chat_input("Ask me anything about Rutgers University…")
@@ -686,32 +1363,48 @@ prompt = st.chat_input("Ask me anything about Rutgers University…")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(f'<div class="user-message">{prompt}</div>', unsafe_allow_html=True)
 
     with st.chat_message("assistant"):
         try:
             # Determine current mode
             current_mode = "explainable" if mode == "Explainable AI" else "black_box"
             
-            with st.spinner("Searching Rutgers knowledge base…"):
-                answer, sources, stream_gen, confidence_level, is_hallucination = ask_rutgers_question(
-                    collection, prompt, stream=True
-                )
+            # Show typing animation
+            placeholder = typing_animation()
+            
+            # Get response
+            answer, sources, stream_gen, confidence_level, is_hallucination = ask_rutgers_question(
+                collection, prompt, stream=True
+            )
+
+            # Clear typing animation
+            placeholder.empty()
 
             # Stream response
             if stream_gen:
-                placeholder = st.empty()
+                response_placeholder = st.empty()
                 buf = []
+                start_time = time.time()
+                
                 for piece in stream_gen:
                     buf.append(piece)
-                    placeholder.markdown("".join(buf))
+                    response_placeholder.markdown("".join(buf))
                 answer = "".join(buf)
+                
+                # Calculate response time
+                response_time = time.time() - start_time
                 
                 # Re-check for hallucination after streaming
                 if sources:
                     is_hallucination, reason = detect_hallucination(sources, answer, confidence_level)
             else:
-                st.markdown(answer)
+                start_time = time.time()
+                format_smart_response(answer, sources)
+                response_time = time.time() - start_time
+            
+            # Show performance metrics
+            st.caption(f"⚡ Response time: {response_time:.2f}s | 📚 Sources: {len(sources)}")
             
             # EXPLAINABLE MODE: Show confidence and warnings
             if current_mode == "explainable":
@@ -773,6 +1466,9 @@ if prompt:
                 question=prompt,
                 answer=answer
             )
+            
+            # Add response rating
+            render_response_rating()
 
         except Exception as e:
             answer = f"⚠️ Error during answer generation:\n\n```\n{traceback.format_exc()}\n```"
