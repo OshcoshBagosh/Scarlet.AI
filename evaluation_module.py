@@ -14,9 +14,15 @@ import streamlit as st
 class EvaluationLogger:
     """Handles logging of user interactions and feedback."""
     
-    def __init__(self, log_dir: str = "./evaluation_logs"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+    def __init__(self, log_dir: str = "evaluation_logs"):
+        # Always anchor logs next to the code, not the shell CWD
+        base_dir = Path(__file__).resolve().parent
+        log_dir_path = Path(log_dir)
+        if not log_dir_path.is_absolute():
+            log_dir_path = base_dir / log_dir_path
+
+        self.log_dir = log_dir_path
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         
         self.interactions_file = self.log_dir / "interactions.jsonl"
         self.feedback_file = self.log_dir / "feedback.csv"
@@ -25,6 +31,7 @@ class EvaluationLogger:
         # Initialize CSV if it doesn't exist
         if not self.feedback_file.exists():
             self._init_feedback_csv()
+
     
     def _init_feedback_csv(self):
         """Initialize feedback CSV with headers."""
@@ -33,11 +40,19 @@ class EvaluationLogger:
             writer.writerow([
                 'timestamp', 'question', 'mode', 'helpful', 
                 'trust_rating', 'accuracy_rating', 'clarity_rating',
-                'confidence_level', 'num_sources', 'had_warning'
+                'confidence_level', 'num_sources', 'had_warning',
+                'claim_checking_enabled', 'policy_aware_enabled',
+                'topic_category', 'risk_level', 'had_policy_disclaimer'
             ])
     
     def log_interaction(self, question: str, answer: str, sources: List[Dict], 
-                       mode: str, confidence_level: str, had_warning: bool):
+                       mode: str, confidence_level: str, had_warning: bool,
+                       claim_checking_enabled: bool = False,
+                       policy_aware_enabled: bool = False,
+                       topic_category: Optional[str] = None,
+                       risk_level: Optional[str] = None,
+                       had_policy_disclaimer: bool = False,
+                       claim_verifications: Optional[List[Dict]] = None):
         """
         Log a complete interaction for analysis.
         
@@ -48,6 +63,12 @@ class EvaluationLogger:
             mode: "black_box" or "explainable"
             confidence_level: Confidence level of answer
             had_warning: Whether hallucination warning was shown
+            claim_checking_enabled: Whether claim-level checking was used
+            policy_aware_enabled: Whether policy-aware filtering was used
+            topic_category: Classified topic (e.g., "mental_health", "housing")
+            risk_level: Risk level (low/medium/high)
+            had_policy_disclaimer: Whether safety disclaimer was added
+            claim_verifications: List of claim verification results
         """
         interaction = {
             'timestamp': datetime.now().isoformat(),
@@ -57,6 +78,11 @@ class EvaluationLogger:
             'confidence_level': confidence_level,
             'num_sources': len(sources),
             'had_warning': had_warning,
+            'claim_checking_enabled': claim_checking_enabled,
+            'policy_aware_enabled': policy_aware_enabled,
+            'topic_category': topic_category,
+            'risk_level': risk_level,
+            'had_policy_disclaimer': had_policy_disclaimer,
             'sources': [
                 {
                     'title': s.get('title', ''),
@@ -67,12 +93,21 @@ class EvaluationLogger:
             ]
         }
         
+        # Add claim verification results if available
+        if claim_verifications:
+            interaction['claim_verifications'] = claim_verifications
+        
         with open(self.interactions_file, 'a', encoding='utf-8') as f:
             f.write(json.dumps(interaction) + '\n')
     
     def log_feedback(self, question: str, mode: str, helpful: str, 
                     trust_rating: int, accuracy_rating: int, clarity_rating: int,
-                    confidence_level: str, num_sources: int, had_warning: bool):
+                    confidence_level: str, num_sources: int, had_warning: bool,
+                    claim_checking_enabled: bool = False,
+                    policy_aware_enabled: bool = False,
+                    topic_category: Optional[str] = None,
+                    risk_level: Optional[str] = None,
+                    had_policy_disclaimer: bool = False):
         """
         Log user feedback for an answer.
         
@@ -86,6 +121,11 @@ class EvaluationLogger:
             confidence_level: Confidence level shown
             num_sources: Number of sources provided
             had_warning: Whether warning was shown
+            claim_checking_enabled: Whether claim checking was used
+            policy_aware_enabled: Whether policy-aware filtering was used
+            topic_category: Classified topic
+            risk_level: Risk level (low/medium/high)
+            had_policy_disclaimer: Whether safety disclaimer was shown
         """
         with open(self.feedback_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -99,7 +139,12 @@ class EvaluationLogger:
                 clarity_rating,
                 confidence_level,
                 num_sources,
-                had_warning
+                had_warning,
+                claim_checking_enabled,
+                policy_aware_enabled,
+                topic_category if topic_category else '',
+                risk_level if risk_level else '',
+                had_policy_disclaimer
             ])
     
     def log_accuracy_evaluation(self, question: str, answer: str, 
@@ -171,22 +216,30 @@ class EvaluationLogger:
 
 
 def render_feedback_widget(logger: EvaluationLogger, question: str, mode: str, 
-                          confidence_level: str, num_sources: int, had_warning: bool):
-    """
-    Render Streamlit feedback collection widget.
+                          confidence_level: str, num_sources: int, had_warning: bool,
+                          claim_checking_enabled: bool = False,
+                          policy_aware_enabled: bool = False,
+                          topic_category: Optional[str] = None,
+                          risk_level: Optional[str] = None,
+                          had_policy_disclaimer: bool = False,
+                          widget_id: Optional[str] = None):
+    """Render Streamlit feedback collection widget with stable state.
     
-    Args:
-        logger: EvaluationLogger instance
-        question: Original question
-        mode: Current mode
-        confidence_level: Confidence level of answer
-        num_sources: Number of sources used
-        had_warning: Whether warning was shown
+    If a widget_id is provided, we use it to create a stable form key
+    so that submission state persists across reruns. Once feedback is
+    submitted for a given widget_id, we show a thank-you message instead
+    of the form on subsequent reruns.
     """
+    # If widget already submitted, show acknowledgement and return
+    if widget_id and st.session_state.get(f"feedback_submitted_{widget_id}"):
+        st.markdown("---")
+        st.caption("✅ Feedback already submitted for this answer.")
+        return False
     st.markdown("---")
     st.subheader("📊 Help Us Improve")
     
-    with st.form(key=f"feedback_form_{datetime.now().timestamp()}"):
+    form_key = f"feedback_form_{widget_id}" if widget_id else f"feedback_form_{datetime.now().timestamp()}"
+    with st.form(key=form_key):
         st.write("**How would you rate this answer?**")
         
         col1, col2 = st.columns(2)
@@ -229,9 +282,16 @@ def render_feedback_widget(logger: EvaluationLogger, question: str, mode: str,
                 clarity_rating=clarity_rating,
                 confidence_level=confidence_level,
                 num_sources=num_sources,
-                had_warning=had_warning
+                had_warning=had_warning,
+                claim_checking_enabled=claim_checking_enabled,
+                policy_aware_enabled=policy_aware_enabled,
+                topic_category=topic_category,
+                risk_level=risk_level,
+                had_policy_disclaimer=had_policy_disclaimer
             )
             st.success("✅ Thank you for your feedback!")
+            if widget_id:
+                st.session_state[f"feedback_submitted_{widget_id}"] = True
             return True
     
     return False
@@ -337,16 +397,19 @@ def render_evaluation_dashboard(logger: EvaluationLogger):
     
     # Data export
     st.subheader("Export Data")
-    
-    if st.button("Download Feedback CSV"):
-        if logger.feedback_file.exists():
-            with open(logger.feedback_file, 'r', encoding='utf-8') as f:
-                st.download_button(
-                    "📥 Download Feedback Data",
-                    f.read(),
-                    file_name=f"scarlet_ai_feedback_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
+
+    if logger.feedback_file.exists():
+        with open(logger.feedback_file, 'r', encoding='utf-8') as f:
+            csv_data = f.read()
+        st.download_button(
+            "📥 Download Feedback Data",
+            csv_data,
+            file_name=f"scarlet_ai_feedback_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No feedback logged yet.")
+
 
 
 # Export main components
