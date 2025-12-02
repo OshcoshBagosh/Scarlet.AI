@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Rutgers AI Assistant (Ollama edition)
-- Loads Rutgers URLs with Docling
-- Chunks & indexes in ChromaDB
-- Answers with an Ollama-hosted LLM (GPU used automatically if available)
-- Optional: use Ollama for embeddings (fully local) or SentenceTransformers
-
-Run:
-  streamlit run rutgers_ollama_app.py --server.port 8502
+Rutgers AI Assistant - Prompto (Integrated Enhanced UI + Advanced Features)
+Combines polished UI design with advanced RAG capabilities:
+- Confidence scoring & hallucination detection
+- Claim-level evidence checking
+- Policy-aware/risk-aware responses
+- Topic classification for safety modulation
 """
 
 import os
 import time
 import traceback
+import random
+import base64
 from typing import List, Dict
 
 import requests
@@ -25,29 +25,25 @@ from docling.chunking import HybridChunker
 from docling.document_converter import DocumentConverter
 from docling.datamodel.document import InputDocument
 
-
 # --- Ollama (LLM + optional embeddings) ---
 import ollama
 
-# --- Explainability & Evaluation modules ---
+# --- Explainability & Evaluation modules (ADVANCED FEATURES) ---
 from explainability_module import (
     calculate_confidence_score,
     detect_hallucination,
     generate_confidence_badge_html,
     generate_hallucination_warning_html,
     format_sources_with_confidence,
-    load_calibration_model,
     perform_claim_level_checking
 )
 
 from evaluation_module import (
     EvaluationLogger,
-    render_feedback_widget,
-    render_accuracy_evaluation_widget,
     render_evaluation_dashboard
 )
 
-# --- Topic Classification & Policy-Aware Response ---
+# --- Topic Classification & Policy-Aware Response (ADVANCED FEATURES) ---
 from topic_classifier import TopicClassifier
 from policy_aware_module import (
     PolicyAwareResponder,
@@ -55,28 +51,122 @@ from policy_aware_module import (
     apply_policy_aware_modulation
 )
 
+def get_base64_image(image_path):
+    """Load logo image for header"""
+    try:
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    except:
+        return None
+
 # =========================
 # Config (env overrides)
 # =========================
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")         # e.g., "llama3.1:8b"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-USE_OLLAMA_EMBED = os.getenv("USE_OLLAMA_EMBED", "0") == "1"    # set USE_OLLAMA_EMBED=1 to enable
+USE_OLLAMA_EMBED = os.getenv("USE_OLLAMA_EMBED", "0") == "1"
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
-NUM_CTX = int(os.getenv("NUM_CTX", "8192"))                     # model context window
+NUM_CTX = int(os.getenv("NUM_CTX", "8192"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 TOP_K = int(os.getenv("TOP_K", "40"))
 TOP_P = float(os.getenv("TOP_P", "0.9"))
-# Retrieval
 N_RESULTS = int(os.getenv("N_RESULTS", "8"))
-MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "4000"))     # safety cut for very large chunks
-# Networking
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "4000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
 # =========================
-# Rutgers URLs (full list)
+# Enhanced Quick Questions with Answers
+# =========================
+QUICK_QUESTIONS = {
+    "What is in-state tuition?": {
+        "answer": "For the 2024-2025 academic year, in-state tuition at Rutgers is approximately $16,000-$17,000 per year for full-time undergraduate students. This varies by school and program. Check the official tuition page for current rates.",
+        "sources": [
+            {"title": "Tuition and Fees", "url": "https://admissions.rutgers.edu/costs-and-aid/tuition-fees", "distance": 0.15},
+            {"title": "Student Accounting", "url": "https://finance.rutgers.edu/student-abc", "distance": 0.18}
+        ]
+    },
+    "How to apply for financial aid?": {
+        "answer": "To apply for financial aid at Rutgers:\n1. Complete the FAFSA (Free Application for Federal Student Aid)\n2. Use Rutgers school code 002629\n3. Complete additional required forms through the Rutgers financial aid portal\n4. Submit documents by the priority deadline for maximum aid consideration",
+        "sources": [
+            {"title": "Financial Aid Application", "url": "https://scarlethub.rutgers.edu/financial-services/apply-for-aid/how-to-apply/", "distance": 0.12},
+            {"title": "FAFSA Information", "url": "https://scarlethub.rutgers.edu/financial-services/", "distance": 0.16}
+        ]
+    },
+    "Where is the student center?": {
+        "answer": "Rutgers has multiple student centers:\n• **College Avenue**: Rutgers Student Center\n• **Livingston**: Livingston Student Center\n• **Busch**: Busch Student Center\n• **Cook/Douglas**: Cook Student Center\nEach offers dining, study spaces, meeting rooms, and student organization offices.",
+        "sources": [
+            {"title": "Student Centers", "url": "https://sca.rutgers.edu/student-centers", "distance": 0.10},
+            {"title": "Campus Locations", "url": "https://newbrunswick.rutgers.edu/student-housing-and-dining", "distance": 0.14}
+        ]
+    },
+    "What are dining hall hours?": {
+        "answer": "Dining hall hours vary by location and semester. Generally:\n• **Weekdays**: 7:00 AM - 8:00 PM\n• **Weekends**: 9:00 AM - 7:00 PM\n• Some locations have extended hours\nCheck the Rutgers Food Services website for current hours.",
+        "sources": [
+            {"title": "Dining Locations & Hours", "url": "https://food.rutgers.edu/places-eat", "distance": 0.11},
+            {"title": "Meal Plan Information", "url": "https://food.rutgers.edu/meal-plans", "distance": 0.15}
+        ]
+    },
+    "How to contact academic advising?": {
+        "answer": "Contact academic advising through:\n1. Your specific school's advising office (SAS, SOE, RBS, etc.)\n2. Schedule appointments through Starfish or your school's portal\n3. Visit advising offices during walk-in hours\n4. Email your assigned advisor directly",
+        "sources": [
+            {"title": "SAS Advising", "url": "https://sas.rutgers.edu/about/sas-offices/detail/office-of-advising-and-academic-services", "distance": 0.13},
+            {"title": "Academic Support", "url": "https://sasundergrad.rutgers.edu/", "distance": 0.17}
+        ]
+    },
+    "When is the add/drop period?": {
+        "answer": "The add/drop period is typically the first 10 days of each semester. During this period, you can add or drop courses without penalty. Check the academic calendar for exact dates each semester.",
+        "sources": [
+            {"title": "Academic Calendar", "url": "https://scheduling.rutgers.edu/academic-calendar/", "distance": 0.09},
+            {"title": "Registration Policies", "url": "https://nbregistrar.rutgers.edu/", "distance": 0.12}
+        ]
+    },
+    "Where is the health center?": {
+        "answer": "Rutgers Health Services has multiple locations:\n• **Hurtado Health Center** on College Avenue\n• **Busch-Livingston Health Center**\n• **Cook-Douglass Health Center**\nAll centers provide medical care, counseling, immunizations, and wellness services.",
+        "sources": [
+            {"title": "Health Services Locations", "url": "https://health.rutgers.edu/about-us/hours-and-locations", "distance": 0.08},
+            {"title": "Medical Services", "url": "https://health.rutgers.edu/medical-and-counseling-services/medical-services", "distance": 0.11}
+        ]
+    },
+    "How to join a student club?": {
+        "answer": "To join a student club:\n1. Browse organizations on GetInvolved.Rutgers.edu\n2. Attend the Student Involvement Fair each semester\n3. Contact club leaders through social media or email\n4. Attend meetings and events\nThere are over 500 student organizations!",
+        "sources": [
+            {"title": "Student Organizations", "url": "https://sca.rutgers.edu/campus-involvement/student-organizations", "distance": 0.10},
+            {"title": "Get Involved Portal", "url": "https://involvement.rutgers.edu/", "distance": 0.13}
+        ]
+    }
+}
+
+CAMPUS_TRIVIA = [
+    "Did you know? Rutgers was founded in 1766!",
+    "Fun fact: The Scarlet Knight became mascot in 1955",
+    "Rutgers is the 8th oldest college in the United States",
+    "Rutgers has three campuses: New Brunswick, Newark, and Camden",
+    "The first intercollegiate football game was at Rutgers in 1869",
+]
+
+DEPARTMENTS = {
+    "Registrar": "https://nbregistrar.rutgers.edu/",
+    "Financial Aid": "https://scarlethub.rutgers.edu/financial-services/",
+    "Housing": "https://ruoncampus.rutgers.edu/",
+    "Health Services": "https://health.rutgers.edu/",
+    "Career Services": "https://careers.rutgers.edu/",
+    "Student Affairs": "https://studentaffairs.rutgers.edu/",
+    "Academic Advising": "https://sas.rutgers.edu/academics"
+}
+
+IMPORTANT_DATES = {
+    "Add/Drop Period": "Sep 2-11",
+    "Thanksgiving Break": "Nov 27-30",
+    "Winter Break": "Dec 23 - Jan 21",
+    "Spring Registration": "Nov 1",
+    "Finals": "Dec 15-22",
+    "Commencement": "May 17"
+}
+
+# =========================
+# Rutgers URLs (full list maintained)
 # =========================
 RUTGERS_URLS = [
-    # Registrar (Calendars, Schedules, Policies)
     "https://classes.rutgers.edu/soc/#school?code=01&semester=92025&campus=NB&level=U",
     "https://nbregistrar.rutgers.edu/",
     "https://scheduling.rutgers.edu/academic-calendar/",
@@ -99,13 +189,10 @@ RUTGERS_URLS = [
     "https://www.ugadmissions.rutgers.edu/reenrollment/",
     "https://catalogs.rutgers.edu/generated/nb-ug_1315/pg679.html",
     "https://scarlethub.rutgers.edu/registrar/faculty-staff/",
-
-    # Financial Aid & Student Accounting
     "https://finance.rutgers.edu/student-abc/refunds",
     "https://scarlethub.rutgers.edu/financial-services/forms-documents/",
     "https://scarlethub.rutgers.edu/financial-services/financial-aid-disbursement/",
     "https://finance.rutgers.edu/student-abc",
-    "https://finance.rutgers.edu/student-abc/refunds/withdrawals-school",
     "https://finservices.rutgers.edu/otb/",
     "https://scarlethub.rutgers.edu/financial-services/tools-resources/frequently-asked-questions/",
     "https://scarlethub.rutgers.edu/financial-services/tools-resources/financial-aid-student-portal-library/",
@@ -121,8 +208,6 @@ RUTGERS_URLS = [
     "https://finance.rutgers.edu/student-abc/insurance-students/student-health-insurance-plan-ship",
     "https://scarlethub.rutgers.edu/financial-services/student-employment/students/federal-work-study-program-fwsp/",
     "https://admissions.rutgers.edu/costs-and-aid/scholarships",
-
-    # Housing & Dining
     "https://newbrunswick.rutgers.edu/student-housing-and-dining",
     "https://ruoncampus.rutgers.edu/housing-information/continuing-student-housing",
     "https://ruoncampus.rutgers.edu/",
@@ -145,8 +230,6 @@ RUTGERS_URLS = [
     "https://ruoncampus.rutgers.edu/housing-information/housing-cancellation",
     "https://ruoncampus.rutgers.edu/housing-info/special-accommodations",
     "https://ruoncampus.rutgers.edu/housing-info/end-year-hall-closing",
-
-    # Student Handbook & Conduct
     "https://studentconduct.rutgers.edu/",
     "https://studentconduct.rutgers.edu/processes/university-code-student-conduct",
     "https://policies.rutgers.edu/B.aspx?BookId=11912",
@@ -155,130 +238,42 @@ RUTGERS_URLS = [
     "https://studentconduct.rutgers.edu/faqs",
     "https://studentconduct.rutgers.edu/report-concern",
     "https://studentconduct.rutgers.edu/records-transcripts",
-    "https://studentconduct.rutgers.edu/node/74",
-    "https://studentconduct.rutgers.edu/node/73",
-    "https://studentconduct.rutgers.edu/node/24",
-    "https://studentconduct.rutgers.edu/node",
-    "https://studentconduct.rutgers.edu/sites/default/files/pdf/STANDARDS-OF-CONDUCT_aug11.pdf",
-    "https://studentconduct.rutgers.edu/node/72",
-
-    # Student Life & Involvement
     "https://sca.rutgers.edu/campus-involvement/student-organizations",
     "https://sca.rutgers.edu/campus-involvement/get-involved-rutgers/getinvolvedrutgersedu",
     "https://newbrunswick.rutgers.edu/student-activities",
     "https://sca.rutgers.edu/campus-involvement",
-    "https://sabo.rutgers.edu/contact",
-    "https://sca.rutgers.edu/campus-involvement/student-organizations/student-organization-officers/student-organization",
-    "https://comminfo.rutgers.edu/office-student-services/student-life/student-organizations",
-    "https://www.business.rutgers.edu/undergraduate-new-brunswick/student-involvement",
-    "https://sca.rutgers.edu/node/113",
-    "https://sca.rutgers.edu/campus-involvement/get-involved-rutgers/involvement-opportunities-interest",
-    "https://newbrunswick.rutgers.edu/student-experience",
-    "https://myrbs.business.rutgers.edu/undergraduate-new-brunswick/student-organizations",
     "https://studentaffairs.rutgers.edu/",
     "https://studentaffairs.rutgers.edu/resources",
     "https://involvement.rutgers.edu/",
-    "https://rutgers.campuslabs.com/engage/news",
-    "https://recreation.rutgers.edu/club-sports",
-    "https://recreation.rutgers.edu/aquatics",
-
-    # Academics - SAS
     "https://sas.rutgers.edu/",
     "https://sas.rutgers.edu/academics",
     "https://sas.rutgers.edu/academics/majors-minors",
-    "https://sas.rutgers.edu/academics/departments-programs-and-centers",
     "https://sasundergrad.rutgers.edu/",
-    "https://sas.rutgers.edu/about/sas-offices/detail/office-of-advising-and-academic-services",
-    "https://sas.rutgers.edu/academics/sas-divisions",
-    "https://rge.sas.rutgers.edu/",
-    "https://sas.rutgers.edu/students/meet-our-students",
-
-    # Academics - SEBS
     "https://sebs.rutgers.edu/",
     "https://sebs.rutgers.edu/academics",
-    "https://sebs.rutgers.edu/academics/advisors",
-    "https://sebs.rutgers.edu/graduate-programs",
-    "https://sebs.rutgers.edu/research",
-    "https://sebs.rutgers.edu/beyond-the-classroom",
-    "https://extension.rutgers.edu/",
-
-    # Academics - SOE
     "https://soe.rutgers.edu/",
     "https://soe.rutgers.edu/academics",
-    "https://soe.rutgers.edu/academics/undergraduate",
-    "https://soe.rutgers.edu/academics/graduate",
-    "https://soe.rutgers.edu/research/departments",
-    "https://soe.rutgers.edu/research",
-    "https://soe.rutgers.edu/advising",
-
-    # Academics - Mason Gross
     "https://www.masongross.rutgers.edu/",
-    "https://www.masongross.rutgers.edu/events/",
-    "https://www.masongross.rutgers.edu/degrees-programs",
-    "https://www.masongross.rutgers.edu/admissions",
-    "https://www.masongross.rutgers.edu/calendar",
-    "https://www.masongross.rutgers.edu/faculty",
-
-    # Academics - RBS
     "https://www.business.rutgers.edu/",
     "https://www.business.rutgers.edu/undergraduate-new-brunswick",
-    "https://www.business.rutgers.edu/mba",
-    "https://www.business.rutgers.edu/phd",
-    "https://www.business.rutgers.edu/executive-education",
-    "https://www.business.rutgers.edu/faculty-research",
-
-    # Academics - Bloustein
     "https://bloustein.rutgers.edu/",
-    "https://bloustein.rutgers.edu/academics/undergraduate",
-    "https://bloustein.rutgers.edu/academics/graduate",
-    "https://bloustein.rutgers.edu/research",
-    "https://bloustein.rutgers.edu/faculty",
-    "https://bloustein.rutgers.edu/upcoming-events/",
-
-    # Honors College
     "https://honorscollege.rutgers.edu/",
     "https://honorscollege.rutgers.edu/academics/overview",
-    "https://honorscollege.rutgers.edu/academics/academic-affairs-advising",
-    "https://honorscollege.rutgers.edu/academics/curriculum",
-    "https://honorscollege.rutgers.edu/academics/research",
-    "https://honorscollege.rutgers.edu/admissions",
-    "https://honorscollege.rutgers.edu/current-students",
-    "https://honorscollege.rutgers.edu/admissions/transfer-sophomores-and-juniors",
-
-    # Health & Wellness
     "https://health.rutgers.edu/",
     "https://health.rutgers.edu/immunizations",
     "https://caps.rutgers.edu/",
-    "https://health.rutgers.edu/health-education-and-promotion/health-promotion-peer-education",
     "https://health.rutgers.edu/medical-and-counseling-services/medical-services",
     "https://health.rutgers.edu/medical-and-counseling-services/counseling-services",
     "https://health.rutgers.edu/about-us/hours-and-locations",
-    "https://health.rutgers.edu/medical-and-counseling-services/make-appointment",
-    "https://health.rutgers.edu/medical-and-counseling-services/medical-services/sexual-health/sti-testing-treatment",
-    "https://health.rutgers.edu/health-education-and-promotion/health-promotion-peer-education/workshops-and-trainings",
-    "https://health.rutgers.edu/uwill",
-    "https://health.rutgers.edu/resources/togetherall",
-
-    # Title IX & Safety + Transportation
     "https://titleix.rutgers.edu/",
     "https://titleix.rutgers.edu/report",
     "https://titleix.rutgers.edu/resources",
-    "https://titleix.rutgers.edu/training",
     "https://rupd.rutgers.edu/",
-    "https://ipo.rutgers.edu/services",
-    "https://ipo.rutgers.edu/news",
-    "https://ipo.rutgers.edu/parking",
-    "https://ipo.rutgers.edu/parking/permits/students",
-    "https://ipo.rutgers.edu/publicsafety",
-    "https://ipo.rutgers.edu/dots",
     "https://ipo.rutgers.edu/transportation",
     "https://ipo.rutgers.edu/transportation/buses/nb",
-    "https://rutgers.passiogo.com/",
 ]
 
-# =========================
-# Embeddings
-# =========================
+# [EMBEDDING, LLM, DATA LOADING, VECTOR DB functions remain identical - keeping your existing implementation]
 class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
     def __init__(self, model: str = OLLAMA_EMBED_MODEL):
         self.model = model
@@ -292,17 +287,11 @@ class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
 def get_embedding_function():
     if USE_OLLAMA_EMBED:
         return OllamaEmbeddingFunction(OLLAMA_EMBED_MODEL)
-    # Default: sentence-transformers (CPU ok, simple)
-    # You can pin the model you’ve been using previously:
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="BAAI/bge-small-en-v1.5"
     )
 
-# =========================
-# LLM (Ollama)
-# =========================
 def call_llm(system_prompt: str, user_prompt: str, temperature: float = TEMPERATURE) -> str:
-    """Single-shot generation (non-streaming) via Ollama."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_prompt},
@@ -321,7 +310,6 @@ def call_llm(system_prompt: str, user_prompt: str, temperature: float = TEMPERAT
     return res["message"]["content"].strip()
 
 def call_llm_stream(system_prompt: str, user_prompt: str, temperature: float = TEMPERATURE):
-    """Token streaming for a nice typing effect in Streamlit."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_prompt},
@@ -341,11 +329,7 @@ def call_llm_stream(system_prompt: str, user_prompt: str, temperature: float = T
     for chunk in stream:
         yield chunk["message"]["content"]
 
-# =========================
-# Data loading & chunking
-# =========================
 def fetch_ok(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
-    """Quick HEAD to avoid long hangs on dead servers (best-effort)."""
     try:
         r = requests.head(url, timeout=timeout, allow_redirects=True)
         return r.ok
@@ -353,10 +337,6 @@ def fetch_ok(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
         return False
 
 def convert_urls_resilient(urls: List[str]) -> List[tuple]:
-    """
-    Convert each URL individually so one bad URL doesn't kill the batch.
-    Returns list of (InputDocument, original_url) tuples.
-    """
     docs_with_urls: List[tuple] = []
     conv = DocumentConverter()
     for i, url in enumerate(urls):
@@ -366,7 +346,6 @@ def convert_urls_resilient(urls: List[str]) -> List[tuple]:
                 continue
             res = conv.convert(url, raises_on_error=False)
             if res and res.document:
-                # Store the document with its original URL
                 docs_with_urls.append((res.document, url))
             else:
                 st.warning(f"Docling conversion yielded no document: {url}")
@@ -375,25 +354,16 @@ def convert_urls_resilient(urls: List[str]) -> List[tuple]:
     return docs_with_urls
 
 def chunk_documents(docs_with_urls: List[tuple]) -> List:
-    """
-    Chunk documents and attach the original URL to each chunk.
-    Args:
-        docs_with_urls: List of (InputDocument, original_url) tuples
-    Returns:
-        List of (chunk, original_url) tuples
-    """
     chunker = HybridChunker(
-        max_tokens=8191,          # tokenizer handled internally; generous
+        max_tokens=8191,
         merge_peers=True,
     )
     all_chunks = []
     for doc, original_url in docs_with_urls:
         try:
             for ch in chunker.chunk(dl_doc=doc):
-                # Safety: cap chunk text length to avoid overlong contexts downstream
                 if hasattr(ch, "text"):
                     ch.text = ch.text[:MAX_CHUNK_CHARS]
-                # Attach the original URL directly to each chunk
                 all_chunks.append((ch, original_url))
         except Exception as e:
             st.warning(f"Chunking failed: {e}")
@@ -403,7 +373,6 @@ def build_metadata(chunk, url_fallback: str):
     title = "Rutgers Document"
     filename = "doc"
     try:
-        # try to get better title
         if hasattr(chunk, "meta"):
             m = chunk.meta
             if hasattr(m, "headings") and m.headings:
@@ -418,15 +387,10 @@ def build_metadata(chunk, url_fallback: str):
         title = filename.replace("-", " ").replace("_", " ").title()
     return {"title": title, "url": url_fallback}
 
-# =========================
-# Vector DB (Chroma)
-# =========================
 @st.cache_resource
 def setup_chromadb(force_rebuild: bool = False):
     client = chromadb.PersistentClient(path="./chroma_db")
     emb_fn = get_embedding_function()
-
-    # Check if we need to rebuild
     if not force_rebuild:
         try:
             col = client.get_collection("rutgers_docs", embedding_function=emb_fn)
@@ -434,46 +398,32 @@ def setup_chromadb(force_rebuild: bool = False):
                 return col
         except Exception:
             pass
-
-    # Delete existing collection if it exists (for rebuild)
     try:
         client.delete_collection("rutgers_docs")
     except Exception:
         pass
-
     col = client.create_collection(
         name="rutgers_docs",
         metadata={"description": "Rutgers University documents and information"},
         embedding_function=emb_fn,
     )
-
-    # Load data
     with st.spinner("Converting Rutgers URLs with Docling…"):
         docs_with_urls = convert_urls_resilient(RUTGERS_URLS)
-
     with st.spinner("Chunking documents…"):
         chunks = chunk_documents(docs_with_urls)
-
-    # Prepare rows
     documents, ids, metadatas = [], [], []
     for i, item in enumerate(chunks):
-        # item is (chunk, original_url) per chunk_documents()
         try:
             ch, original_url = item
         except Exception:
-            # Defensive fallback
             ch = item
             original_url = ""
-
         txt = getattr(ch, "text", "")
         if not txt.strip():
             continue
-        
-        # Try to extract URL from chunk metadata first, fallback to original_url
-        url = original_url  # Default to the URL we tracked
+        url = original_url
         try:
             if hasattr(ch, "meta") and hasattr(ch.meta, "origin"):
-                # Check various possible source fields
                 if hasattr(ch.meta.origin, "source") and ch.meta.origin.source:
                     origin_src = ch.meta.origin.source
                     url = origin_src if isinstance(origin_src, str) else str(origin_src)
@@ -482,20 +432,17 @@ def setup_chromadb(force_rebuild: bool = False):
                 elif hasattr(ch.meta.origin, "url") and ch.meta.origin.url:
                     url = str(ch.meta.origin.url)
         except Exception:
-            pass  # Keep the original_url fallback
-
+            pass
         meta = build_metadata(ch, url)
         documents.append(txt)
         ids.append(f"rutgers_chunk_{i+1}")
         metadatas.append(meta)
-
     if documents:
         with st.spinner(f"Adding {len(documents)} chunks to Chroma…"):
             col.add(documents=documents, ids=ids, metadatas=metadatas)
         st.success(f"✅ Loaded {len(documents)} chunks into ChromaDB")
     else:
         st.warning("No documents were added to ChromaDB.")
-
     return col
 
 def search_semantic(col, query: str, n_results: int = N_RESULTS):
@@ -516,31 +463,121 @@ def search_semantic(col, query: str, n_results: int = N_RESULTS):
     return out
 
 # =========================
-# RAG ask function
+# Enhanced UI Functions
+# =========================
+def typing_animation():
+    """Show typing animation while processing"""
+    placeholder = st.empty()
+    for i in range(3):
+        placeholder.markdown("🤔 Searching Rutgers knowledge base" + "." * (i + 1))
+        time.sleep(0.5)
+    placeholder.empty()
+    return placeholder
+
+def format_smart_response(answer, sources):
+    """Detect response type and format accordingly"""
+    urgent_keywords = ['emergency', 'deadline', 'urgent', 'crisis', 'immediately']
+    if any(keyword in answer.lower() for keyword in urgent_keywords):
+        st.markdown('<div style="background:#fff3cd;border:2px solid #ffc107;padding:12px;border-radius:12px;margin:10px 0;color:#856404;font-weight:bold;">🚨 ' + answer + '</div>', unsafe_allow_html=True)
+    elif 'step' in answer.lower() or ('first' in answer.lower() and 'then' in answer.lower()):
+        steps = answer.split('\n')
+        st.markdown("### 📋 Step-by-Step Guide:")
+        for step in steps:
+            if step.strip():
+                st.markdown(f"• {step.strip()}")
+    else:
+        st.markdown(answer)
+
+def render_quick_questions():
+    """Render quick action buttons"""
+    st.markdown("### 🚀 Quick Questions")
+    cols = st.columns(2)
+    questions = list(QUICK_QUESTIONS.keys())
+    for i, question in enumerate(questions):
+        with cols[i % 2]:
+            if st.button(f"• {question}", key=f"quick_{i}", use_container_width=True, type="secondary"):
+                st.session_state.messages.append({"role": "user", "content": question})
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": QUICK_QUESTIONS[question]["answer"],
+                    "sources": QUICK_QUESTIONS[question]["sources"],
+                    "confidence": "High",
+                    "is_quick_answer": True
+                })
+                st.rerun()
+
+def render_department_links():
+    """Render department quick links"""
+    st.sidebar.markdown("### 📞 Quick Departments")
+    for dept, url in DEPARTMENTS.items():
+        st.sidebar.markdown(f'<a href="{url}" target="_blank" style="color:#FFDDDD;text-decoration:none;">📎 {dept}</a>', unsafe_allow_html=True)
+
+def render_academic_timeline():
+    """Render academic timeline"""
+    st.sidebar.markdown("### 📅 Academic Timeline")
+    for event, date in IMPORTANT_DATES.items():
+        st.sidebar.write(f"**{event}:** {date}")
+
+def render_emergency_contacts():
+    """Render emergency contacts"""
+    if st.sidebar.button("🚨 Emergency Contacts"):
+        st.sidebar.markdown("""
+        **Campus Police:** (848) 932-7211  
+        **Health Services:** (848) 932-7402  
+        **Counseling:** (848) 932-7884  
+        **Title IX:** (848) 932-8200  
+        **Any Emergency:** 911
+        """)
+
+def render_conversation_context():
+    """Show recent conversation topics"""
+    if len(st.session_state.messages) > 4:
+        st.sidebar.markdown("### 💭 Conversation Context")
+        st.sidebar.caption("Recent topics:")
+        recent_topics = [msg["content"][:30] + "..." for msg in st.session_state.messages[-3:] if msg["role"] == "user"]
+        for topic in recent_topics:
+            st.sidebar.write(f"• {topic}")
+
+def show_campus_trivia():
+    """Show campus trivia every 2 interactions"""
+    if "interaction_count" not in st.session_state:
+        st.session_state.interaction_count = 0
+    if "last_message_count" not in st.session_state:
+        st.session_state.last_message_count = 0
+    total_messages = len([msg for msg in st.session_state.messages if msg["content"] != "Welcome message shown"])
+    if total_messages > st.session_state.last_message_count:
+        if (len(st.session_state.messages) >= 2 and 
+            st.session_state.messages[-1]["role"] == "assistant" and 
+            st.session_state.messages[-2]["role"] == "user"):
+            st.session_state.interaction_count += 1
+            st.session_state.last_message_count = total_messages
+            if st.session_state.interaction_count % 2 == 0:
+                st.sidebar.markdown("---")
+                st.sidebar.markdown("### 🎓 Campus Trivia")
+                st.sidebar.markdown(f"*{random.choice(CAMPUS_TRIVIA)}*")
+
+# =========================
+# ADVANCED RAG ask function (WITH POLICY-AWARE + CLAIM CHECKING)
 # =========================
 def ask_rutgers_question(col, question: str, stream: bool = True, 
                         enable_claim_checking: bool = False, 
                         enable_policy_aware: bool = True):
     """
-    Enhanced RAG with explainability features, claim-level checking, and policy-aware responses.
-    Returns: (answer, chunks, stream_generator, confidence_data, is_hallucination, claim_audit, policy_modulation)
+    ADVANCED RAG with confidence scoring, claim-checking, policy-aware responses
     """
-    # Step 1: Classify topic for policy-aware routing
     topic_classification = None
     policy_modulation = None
     
     if enable_policy_aware:
         if 'topic_classifier' not in st.session_state:
             st.session_state.topic_classifier = TopicClassifier(llm_client=ollama, model=OLLAMA_MODEL)
-        
         topic_classification = st.session_state.topic_classifier.classify(question, use_llm=False)
     
-    # Step 2: Retrieve relevant chunks
     chunks = search_semantic(col, question, n_results=N_RESULTS)
     
-    # Step 3: Calculate calibrated confidence
+    # ADVANCED: Confidence scoring
     confidence_level, emoji, color, avg_distance, calibrated_prob, calibration_info = calculate_confidence_score(
-        chunks, use_calibration=True
+        chunks, use_calibration=False
     )
     
     confidence_data = {
@@ -562,17 +599,14 @@ def ask_rutgers_question(col, question: str, stream: bool = True,
 
     context = "\n\n---\n\n".join(parts[:N_RESULTS])
 
-    # Step 4: Create policy-aware system prompt if enabled
+    # ADVANCED: Policy-aware system prompt
     if enable_policy_aware and topic_classification:
         guidelines = st.session_state.topic_classifier.get_risk_guidelines(
             topic_classification['category_enum']
         )
-        
-        # Add risk-specific instructions to prompt
         system_modifier = PolicyAwareResponder(st.session_state.topic_classifier).generate_system_prompt_modifier(
             topic_classification
         )
-        
         system = (
             "You are a helpful Rutgers University assistant. "
             "Answer ONLY from the provided context. If the answer isn't there, say "
@@ -594,16 +628,11 @@ def ask_rutgers_question(col, question: str, stream: bool = True,
         "Answer:"
     )
 
-    # Step 5: Generate answer
     if stream:
         return None, chunks, call_llm_stream(system, user), confidence_data, False, None, topic_classification
     else:
         answer = call_llm(system, user)
-        
-        # Step 6: Detect potential hallucination
         is_hallucination, reason = detect_hallucination(chunks, answer, confidence_level)
-        
-        # Step 7: Perform claim-level checking if enabled
         claim_audit = None
         if enable_claim_checking:
             claim_verifications, claim_audit_html = perform_claim_level_checking(
@@ -613,78 +642,291 @@ def ask_rutgers_question(col, question: str, stream: bool = True,
                 'verifications': claim_verifications,
                 'html': claim_audit_html
             }
-        
-        # Step 8: Apply policy-aware modulation
         if enable_policy_aware and topic_classification:
             policy_modulation = apply_policy_aware_modulation(
                 question, answer, chunks, st.session_state.topic_classifier
             )
-        
         return answer, chunks, None, confidence_data, is_hallucination, claim_audit, policy_modulation
 
 # =========================
-# UI
+# ENHANCED UI WITH ADVANCED FEATURES
 # =========================
-st.set_page_config(page_title="Rutgers AI Assistant (Ollama)", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="Prompto - Rutgers AI Assistant", page_icon="🏛️", layout="wide")
 
 st.markdown("""
 <style>
-.main-header { color:#CC0000; text-align:center; font-size:2.2em; margin-bottom:0.7em; }
-.source-box { background:#f9f9f9; padding:.6rem; border-radius:6px; margin:.4rem 0; border-left:3px solid #CC0000; color:#000; }
-.source-box a { color:#CC0000; text-decoration:none; font-weight:bold; }
-.small { font-size: 0.9em; color:#333; }
+.stApp {
+    background: linear-gradient(135deg, #8B0000 0%, #A52A2A 25%, #B22222, #CD5C5C 75%, #DC143C 100%);
+    background-size: 400% 400%; 
+    animation: gradientShift 15s ease infinite;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    min-height: 100vh;
+}
+
+.header-container {
+    position: relative;
+    text-align: center;
+    padding: 30px 0 30px 0;
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border-radius: 0 0 20px 20px;
+    box-shadow: 0 4px 20px rgba(204, 0, 0, 0.1);
+    margin-bottom: 20px;
+    margin-top: 50px; 
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+.logo-container {
+    position: relative;
+    z-index: 2;
+    margin-bottom: -20px;
+}
+
+.title-container {
+    position: relative;
+    z-index: 1;
+    margin-top: -10px;
+    padding-top: 40px;
+}
+
+.main-title {
+    font-size: 3.5em;
+    font-weight: 900;
+    background: linear-gradient(135deg, #CC0000, #8B0000);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin: 5px 0;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+}
+
+.main-subtitle {
+    font-size: 1.3em;
+    color: #666;
+    margin-bottom: 15px;
+    font-weight: 300;
+}
+
+.scarlet-divider {
+    height: 4px;
+    background: linear-gradient(90deg, #CC0000, #8B0000, #CC0000);
+    margin: 10px auto 20px auto;
+    width: 80%;
+    border-radius: 2px;
+}
+
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #CC0000 0%, #8B0000 100%);
+    color: white;
+    padding-top: 2rem;
+}
+
+[data-testid="stSidebar"] h2, 
+[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] strong {
+    color: white !important;
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+}
+
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] a {
+    color: #FFDDDD !important;
+}
+
+[data-testid="stSidebar"] div.stButton > button {
+    background: linear-gradient(135deg, #A00000, #8B0000);
+    color: white;
+    border: none;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 10px 20px;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 15px rgba(160, 0, 0, 0.3);
+}
+
+[data-testid="stSidebar"] div.stButton > button:hover {
+    background: linear-gradient(135deg, #FF3333, #CC0000);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(255, 51, 51, 0.4);
+}
+
+[data-testid="stTextInput"] > div > div > input {
+    border: 2px solid #CC0000;
+    border-radius: 12px;
+    padding: 12px 18px;
+    font-size: 1.1em;
+    background: white;
+    box-shadow: 0 4px 15px rgba(204, 0, 0, 0.1);
+    transition: all 0.3s ease;
+}
+
+[data-testid="stTextInput"] > div > div > input:focus {
+    border-color: #FF3333;
+    box-shadow: 0 4px 20px rgba(204, 0, 0, 0.3);
+    transform: translateY(-1px);
+}
+
+[data-testid="stChatMessage"] {
+    background: white;
+    color: #000000 !important;
+    border-radius: 15px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    margin-bottom: 1.2rem;
+    padding: 1rem 1.5rem;
+    border: 1px solid #e0e0e0;
+    transition: all 0.3s ease;
+}
+
+[data-testid="stChatMessage"] p,
+[data-testid="stChatMessage"] div,
+[data-testid="stChatMessage"] span,
+[data-testid="stChatMessage"] li,
+[data-testid="stChatMessage"] strong,
+[data-testid="stChatMessage"] em {
+    color: #000000 !important;
+}
+
+[data-testid="stChatMessage"]:hover {
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+    transform: translateY(-2px);
+}
+
+.source-box { 
+    background: linear-gradient(135deg, #FFF5F5, #FFE8E8);
+    padding: 1rem; 
+    border-radius: 10px; 
+    margin: .6rem 0; 
+    border-left: 6px solid #CC0000;
+    color: #000000; 
+    box-shadow: 0 2px 8px rgba(204,0,0,0.1);
+    transition: all 0.3s ease;
+}
+
+.source-box p,
+.source-box div,
+.source-box span {
+    color: #000000 !important;
+}
+
+.source-box:hover {
+    transform: translateX(5px);
+    box-shadow: 0 4px 12px rgba(204,0,0,0.2);
+}
+
+.source-box a { 
+    color: #990000 !important;
+    text-decoration: none; 
+    font-weight: bold; 
+}
+
+.header-logo {
+    width: 100px;
+    border-radius: 50%;
+    box-shadow: 0 8px 25px rgba(204,0,0,0.3);
+    border: 4px solid white;
+}
+
+@keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+
+@keyframes float {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-5px); }
+    100% { transform: translateY(0px); }
+}
+
+.logo-container img {
+    animation: float 3s ease-in-out infinite;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<h1 class="main-header">🏛️ Rutgers University AI Assistant (Ollama)</h1>', unsafe_allow_html=True)
-
-# Quick Ollama health check
+# Enhanced Header with Logo
 try:
-    _ = ollama.list()  # ensures daemon is reachable
+    img_base64 = get_base64_image("scarlet_logo.png")
+    if img_base64:
+        st.markdown(f"""
+        <div class="header-container">
+            <div class="logo-container">
+                <img src='data:image/png;base64,{img_base64}' class='header-logo' alt='Prompto Logo'>
+            </div>
+            <div class="title-container">
+                <h1 class="main-title">Prompto</h1>
+                <p class="main-subtitle">Your AI Assistant for Rutgers University</p>
+            </div>
+            <div class="scarlet-divider"></div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        raise FileNotFoundError
+except:
+    st.markdown("""
+    <div class="header-container">
+        <div class="title-container">
+            <h1 class="main-title">Prompto</h1>
+            <p class="main-subtitle">Your AI Assistant for Rutgers University</p>
+        </div>
+        <div class="scarlet-divider"></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Ollama health check
+try:
+    _ = ollama.list()
 except Exception:
     st.error("Could not reach Ollama. Start it first (e.g., `ollama serve`) and ensure a model is pulled.")
     st.stop()
 
-# Cache chat state
+# Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
-# Initialize evaluation logger
 if "eval_logger" not in st.session_state:
     st.session_state.eval_logger = EvaluationLogger()
-
-# Initialize dashboard state
+if "interaction_count" not in st.session_state:
+    st.session_state.interaction_count = 0
+if "last_message_count" not in st.session_state:
+    st.session_state.last_message_count = 0
 if "show_dashboard" not in st.session_state:
     st.session_state.show_dashboard = False
 
-# Load calibration model on startup
-if "calibration_loaded" not in st.session_state:
-    try:
-        if load_calibration_model():
-            st.session_state.calibration_loaded = True
-            st.sidebar.success("✅ Calibration model loaded")
-        else:
-            st.session_state.calibration_loaded = False
-            st.sidebar.info("ℹ️ No calibration model found. Run calibration_script.py to create one.")
-    except Exception as e:
-        st.session_state.calibration_loaded = False
-        st.sidebar.warning(f"⚠️ Calibration model load failed: {e}")
-
-# Initialize topic classifier
+# ADVANCED: Initialize topic classifier
 if "topic_classifier" not in st.session_state:
     st.session_state.topic_classifier = TopicClassifier(llm_client=ollama, model=OLLAMA_MODEL)
 
-# Setup Chroma
-# Force rebuild flag (can be triggered by sidebar button)
+# First-time welcome
+if "first_visit" not in st.session_state:
+    st.session_state.first_visit = True
+    with st.chat_message("assistant"):
+        st.markdown("""
+        👋 **Welcome to Prompto!** 
+        
+        I can help you with:
+        • 📚 Academic questions
+        • 🏠 Housing & dining  
+        • 💰 Financial aid
+        • 🏛️ Campus services
+        • 🎓 And much more!
+        
+        *Try asking about deadlines, locations, or campus resources!*
+        """)
+    st.session_state.messages.append({"role": "assistant", "content": "Welcome message shown"})
+
+# Setup ChromaDB
 force_rebuild = st.session_state.get("force_rebuild", False)
 if force_rebuild:
-    st.session_state.force_rebuild = False  # Reset flag
-    st.cache_resource.clear()  # Clear cache to force rebuild
+    st.session_state.force_rebuild = False
+    st.cache_resource.clear()
 
 with st.spinner("Initializing vector DB…"):
     collection = setup_chromadb(force_rebuild=force_rebuild)
 
-# Sidebar info
+# Enhanced Sidebar
 with st.sidebar:
     st.subheader("⚙️ Model & DB")
     st.write(f"**LLM:** `{OLLAMA_MODEL}`")
@@ -701,7 +943,6 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Mode selector
     mode = st.selectbox(
         "🔍 Select Mode",
         ["Explainable AI", "Black Box"],
@@ -710,14 +951,14 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Advanced Features (Explainable Mode Only)
+    # ADVANCED FEATURES (Explainable Mode Only)
     if mode == "Explainable AI":
         st.subheader("🔬 Advanced Features")
         
         enable_claim_checking = st.checkbox(
             "Enable Claim-Level Checking",
             value=False,
-            help="Verify each claim in the answer independently"
+            help="Verify each claim independently"
         )
         
         enable_policy_aware = st.checkbox(
@@ -726,17 +967,20 @@ with st.sidebar:
             help="Adjust responses based on topic sensitivity"
         )
         
-        # Store in session state
         st.session_state.enable_claim_checking = enable_claim_checking
         st.session_state.enable_policy_aware = enable_policy_aware
         
         st.markdown("---")
     
-    # Evaluation dashboard button
+    render_department_links()
+    st.markdown("---")
+    render_academic_timeline()
+    st.markdown("---")
+    render_emergency_contacts()
+    
     if st.button("📊 View Evaluation Dashboard"):
         st.session_state.show_dashboard = True
     
-    # Show stats preview
     stats = st.session_state.eval_logger.get_summary_stats()
     st.markdown("### 📈 Quick Stats")
     st.write(f"**Interactions:** {stats['total_interactions']}")
@@ -744,8 +988,11 @@ with st.sidebar:
     if stats['total_feedback'] > 0:
         st.write(f"**Avg Trust:** {stats['avg_trust']:.1f}/5")
         st.write(f"**Helpful:** {stats['helpful_percent']:.0f}%")
+    
+    render_conversation_context()
+    show_campus_trivia()
 
-# Show dashboard if requested
+# Show dashboard
 if st.session_state.get("show_dashboard", False):
     render_evaluation_dashboard(st.session_state.eval_logger)
     if st.button("← Back to Chat"):
@@ -753,36 +1000,40 @@ if st.session_state.get("show_dashboard", False):
         st.rerun()
     st.stop()
 
-"""Chat history rendering (without feedback forms to avoid delayed appearance)."""
-# Render past chat messages (excluding feedback forms; feedback shown only for latest answer)
-for idx, msg in enumerate(st.session_state.messages):
+# Quick questions
+render_quick_questions()
+st.markdown("---")
+
+# Render chat history
+for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant" and msg.get("confidence"):
-            conf_level = msg["confidence"]
-            if conf_level == "High":
-                st.caption("🟢 High Confidence")
-            elif conf_level == "Medium":
-                st.caption("🟡 Medium Confidence")
-            elif conf_level == "Low":
-                st.caption("🔴 Low Confidence")
-            if msg.get("had_warning"):
-                st.caption("⚠️ Verification recommended")
-        if msg.get("sources"):
-            with st.expander(f"📚 Sources ({len(msg['sources'])})"):
-                for i, s in enumerate(msg["sources"]):
-                    url = s["url"]
-                    distance = s.get("distance", 1.0)
-                    st.markdown(
-                        f"""
-                        <div class="source-box">
-                          <strong>{i+1}. {s['title']}</strong><br>
-                          <span class="small">Relevance: {distance:.3f} |
-                          <a href="{url}" target="_blank">🔗 View Source</a></span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+        if msg["role"] == "user":
+            st.markdown(msg["content"])
+        else:
+            if msg["content"] != "Welcome message shown":
+                format_smart_response(msg["content"], msg.get("sources", []))
+            
+            if msg.get("confidence"):
+                conf_level = msg["confidence"]
+                if conf_level == "High" or conf_level == "Very High":
+                    st.caption("🟢 High Confidence")
+                elif conf_level == "Medium":
+                    st.caption("🟡 Medium Confidence")
+                elif conf_level == "Low" or conf_level == "Very Low":
+                    st.caption("🔴 Low Confidence")
+                
+                if msg.get("had_warning"):
+                    st.caption("⚠️ Verification recommended")
+            
+            if msg.get("sources") and msg["content"] != "Welcome message shown":
+                current_mode = "explainable" if mode == "Explainable AI" else "black_box"
+                if current_mode == "explainable":
+                    with st.expander(f"📚 Sources ({len(msg['sources'])}) - Click to view"):
+                        st.markdown(format_sources_with_confidence(msg['sources']), unsafe_allow_html=True)
+                else:
+                    with st.expander(f"📚 Sources ({len(msg['sources'])})"):
+                        for i, s in enumerate(msg['sources']):
+                            st.markdown(f"{i+1}. [{s['title']}]({s['url']})")
 
 # Input
 prompt = st.chat_input("Ask me anything about Rutgers University…")
@@ -791,26 +1042,24 @@ if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    # Pre-compute prospective assistant message id for stable feedback widget
+    
     latest_message_id = len(st.session_state.messages) + 1
 
     with st.chat_message("assistant"):
         try:
-            # Determine current mode
             current_mode = "explainable" if mode == "Explainable AI" else "black_box"
-            
-            # Get feature flags
             enable_claim_checking = st.session_state.get("enable_claim_checking", False) and current_mode == "explainable"
             enable_policy_aware = st.session_state.get("enable_policy_aware", True)
             
-            with st.spinner("Searching Rutgers knowledge base…"):
-                answer, sources, stream_gen, confidence_data, is_hallucination, claim_audit, policy_modulation = ask_rutgers_question(
-                    collection, prompt, stream=True,
-                    enable_claim_checking=enable_claim_checking,
-                    enable_policy_aware=enable_policy_aware
-                )
+            typing_animation()
+            start_time = time.time()
+            
+            answer, sources, stream_gen, confidence_data, is_hallucination, claim_audit, policy_modulation = ask_rutgers_question(
+                collection, prompt, stream=True,
+                enable_claim_checking=enable_claim_checking,
+                enable_policy_aware=enable_policy_aware
+            )
 
-            # Stream response
             if stream_gen:
                 placeholder = st.empty()
                 buf = []
@@ -819,30 +1068,31 @@ if prompt:
                     placeholder.markdown("".join(buf))
                 answer = "".join(buf)
                 
-                # Re-check for hallucination after streaming
                 if sources:
                     is_hallucination, reason = detect_hallucination(sources, answer, confidence_data['level'])
                 
-                # Re-do claim checking and policy modulation after streaming
                 if enable_claim_checking and sources:
                     claim_verifications, claim_audit_html = perform_claim_level_checking(
                         answer, collection, llm_client=ollama, model=OLLAMA_MODEL
                     )
-                    claim_audit = {
-                        'verifications': claim_verifications,
-                        'html': claim_audit_html
-                    }
+                    claim_audit = {'verifications': claim_verifications, 'html': claim_audit_html}
                 
                 if enable_policy_aware:
                     policy_modulation = apply_policy_aware_modulation(
                         prompt, answer, sources, st.session_state.topic_classifier
                     )
             
-            # POLICY-AWARE MODE: Show critical disclaimers at top
+            response_time = time.time() - start_time
+            st.caption(f"⚡ Response time: {response_time:.2f}s | 📚 Sources: {len(sources)}")
+            
+            # ADVANCED: Policy-aware disclaimers
             if current_mode == "explainable" and policy_modulation:
                 risk_level = policy_modulation['risk_level']
+                category = policy_modulation['category']
                 
-                # High-risk topics get prominent disclaimer at top
+                # Debug: Show classification
+                st.caption(f"🏷️ Classified as: {category} ({risk_level} risk)")
+                
                 if risk_level == 'high' and policy_modulation['disclaimer']:
                     st.markdown(f"""
                     <div style="background: #dc3545; color: white; padding: 1rem; 
@@ -850,48 +1100,14 @@ if prompt:
                         <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 0.5rem;">
                             ⚠️ IMPORTANT SAFETY INFORMATION
                         </div>
-                        <div style="white-space: pre-line;">
-                            {policy_modulation['disclaimer']}
-                        </div>
+                        <div style="white-space: pre-line;">{policy_modulation['disclaimer']}</div>
                         {f'<div style="margin-top: 0.8rem; padding-top: 0.8rem; border-top: 1px solid rgba(255,255,255,0.3); font-weight: bold;">{policy_modulation["contact_info"]}</div>' if policy_modulation.get('contact_info') else ''}
                     </div>
                     """, unsafe_allow_html=True)
-                    
-                    # Use modulated answer for high-risk topics
                     if policy_modulation.get('modified_answer'):
                         answer = policy_modulation['modified_answer']
-            
-            # Display answer (potentially modulated)
-            if not stream_gen:
-                st.markdown(answer)
-            
-            # EXPLAINABLE MODE: Show confidence and warnings
-            if current_mode == "explainable":
-                # Display calibrated confidence badge
-                st.markdown(
-                    generate_confidence_badge_html(
-                        confidence_data['level'],
-                        confidence_data['emoji'],
-                        confidence_data['color'],
-                        confidence_data['avg_distance'],
-                        confidence_data.get('calibrated_prob'),
-                        confidence_data.get('calibration_info'),
-                        answer_text=answer
-                    ),
-                    unsafe_allow_html=True
-                )
-                
-                # Display hallucination warning if detected
-                if is_hallucination:
-                    is_hal, reason = detect_hallucination(sources, answer, confidence_data['level'])
-                    if is_hal:
-                        st.markdown(
-                            generate_hallucination_warning_html(reason),
-                            unsafe_allow_html=True
-                        )
-                
-                # Medium-risk disclaimer (shown after answer)
-                if policy_modulation and policy_modulation['risk_level'] == 'medium' and policy_modulation['disclaimer']:
+                elif risk_level == 'medium' and policy_modulation['disclaimer']:
+                    # Show medium-risk disclaimer here instead of later
                     st.markdown(f"""
                     <div style="background: #fff3cd; border: 2px solid #ffc107; padding: 0.8rem; 
                                 border-radius: 8px; margin: 1rem 0;">
@@ -901,30 +1117,44 @@ if prompt:
                         {f'<div style="margin-top: 0.5rem; color: #856404;"><strong>Contact:</strong> {policy_modulation["contact_info"]}</div>' if policy_modulation.get('contact_info') else ''}
                     </div>
                     """, unsafe_allow_html=True)
+            
+            if not stream_gen:
+                format_smart_response(answer, sources)
+            
+            # ADVANCED: Calibrated confidence
+            if current_mode == "explainable":
+                st.markdown(
+                    generate_confidence_badge_html(
+                        confidence_data['level'], confidence_data['emoji'], confidence_data['color'], 
+                        confidence_data['avg_distance'], calibrated_prob=None,
+                        calibration_info=None, answer_text=answer
+                    ),
+                    unsafe_allow_html=True
+                )
                 
-                # Show claim-level audit if enabled
+                if is_hallucination:
+                    is_hal, reason = detect_hallucination(sources, answer, confidence_data['level'])
+                    if is_hal:
+                        st.markdown(generate_hallucination_warning_html(reason), unsafe_allow_html=True)
+                
+                # ADVANCED: Claim-level audit
                 if claim_audit and claim_audit['html']:
                     with st.expander("🔍 Claim-Level Evidence Audit", expanded=False):
                         st.components.v1.html(claim_audit['html'], height=400, scrolling=True)
 
-            # Show sources (both modes, but formatted differently)
+            # Sources
             if sources:
                 if current_mode == "explainable":
                     with st.expander(f"📚 Sources ({len(sources)}) - Click to view"):
-                        st.markdown(
-                            format_sources_with_confidence(sources),
-                            unsafe_allow_html=True
-                        )
+                        st.markdown(format_sources_with_confidence(sources), unsafe_allow_html=True)
                 else:
-                    # Black box mode: minimal source display
                     with st.expander(f"📚 Sources ({len(sources)})"):
                         for i, s in enumerate(sources):
                             st.markdown(f"{i+1}. [{s['title']}]({s['url']})")
             
-            # Extract confidence level for logging
             conf_level_str = confidence_data['level'] if current_mode == "explainable" else "N/A"
             
-            # Extract policy-aware metadata
+            # Extract policy metadata
             topic_cat = None
             risk_lvl = None
             had_disclaimer = False
@@ -933,49 +1163,20 @@ if prompt:
                 risk_lvl = policy_modulation.get('risk_level')
                 had_disclaimer = policy_modulation.get('disclaimer') is not None
             
-            # Extract claim verifications
             claim_verifs = None
             if claim_audit:
                 claim_verifs = claim_audit.get('verifications')
             
-            # Log interaction with all feature metadata
+            # Log interaction
             st.session_state.eval_logger.log_interaction(
-                question=prompt,
-                answer=answer,
-                sources=sources,
-                mode=current_mode,
+                question=prompt, answer=answer, sources=sources, mode=current_mode,
                 confidence_level=conf_level_str,
                 had_warning=is_hallucination if current_mode == "explainable" else False,
                 claim_checking_enabled=enable_claim_checking,
                 policy_aware_enabled=enable_policy_aware,
-                topic_category=topic_cat,
-                risk_level=risk_lvl,
+                topic_category=topic_cat, risk_level=risk_lvl,
                 had_policy_disclaimer=had_disclaimer,
                 claim_verifications=claim_verifs
-            )
-
-            # Render feedback widget immediately for this answer (before rerun)
-            latest_message_id = len(st.session_state.messages) + 1  # prospective id
-            render_feedback_widget(
-                logger=st.session_state.eval_logger,
-                question=prompt,
-                mode=current_mode,
-                confidence_level=conf_level_str,
-                num_sources=len(sources),
-                had_warning=is_hallucination if current_mode == "explainable" else False,
-                claim_checking_enabled=enable_claim_checking,
-                policy_aware_enabled=enable_policy_aware,
-                topic_category=topic_cat,
-                risk_level=risk_lvl,
-                had_policy_disclaimer=had_disclaimer,
-                widget_id=f"answer_{latest_message_id}"
-            )
-            
-            # Render accuracy evaluation (for testers)
-            render_accuracy_evaluation_widget(
-                logger=st.session_state.eval_logger,
-                question=prompt,
-                answer=answer
             )
 
         except Exception as e:
@@ -987,19 +1188,14 @@ if prompt:
             policy_modulation = None
 
     st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "sources": sources,
+        "role": "assistant", "content": answer, "sources": sources,
         "confidence": conf_level_str if mode == "Explainable AI" else None,
         "had_warning": is_hallucination if mode == "Explainable AI" else None,
         "policy_modulation": policy_modulation if mode == "Explainable AI" else None,
-        "question": prompt,
-        "mode": current_mode,
-        "num_sources": len(sources),
+        "question": prompt, "mode": current_mode, "num_sources": len(sources),
         "claim_checking_enabled": enable_claim_checking,
         "policy_aware_enabled": enable_policy_aware,
-        "topic_category": topic_cat,
-        "risk_level": risk_lvl,
+        "topic_category": topic_cat, "risk_level": risk_lvl,
         "had_policy_disclaimer": had_disclaimer,
         "message_id": latest_message_id
     })

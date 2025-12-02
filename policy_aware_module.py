@@ -43,6 +43,35 @@ class PolicyAwareResponder:
         if classification is None:
             classification = self.classifier.classify(question)
         
+        # SAFETY OVERRIDE FOR SUICIDE / SELF-HARM
+        # Force mental-health / high risk regardless of classifier output
+        q_lower = question.lower()
+        suicide_keywords = [
+            "suicidal",
+            "suicide",
+            "kill myself",
+            "want to die",
+            "want to end my life",
+            "end my life",
+            "hurt myself",
+            "self harm",
+            "self-harm",
+            "feeling depressed",
+            "severely depressed",
+            "thoughts of dying",
+            "thoughts of death",
+        ]
+        
+        if any(kw in q_lower for kw in suicide_keywords):
+            # Force mental-health / high risk
+            classification = {
+                **classification,
+                "category_enum": TopicCategory.MENTAL_HEALTH,
+                "category": "mental_health",
+                "risk_level_enum": RiskLevel.HIGH,
+                "risk_level": "high",
+            }
+        
         category = classification['category_enum']
         risk_level = classification['risk_level_enum']
         
